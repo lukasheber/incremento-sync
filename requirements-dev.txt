@@ -1,0 +1,6 @@
+pytest
+pymupdf
+anki==26.9.3
+aqt==26.9.3
+PyQt6
+PyQt6-WebEngine

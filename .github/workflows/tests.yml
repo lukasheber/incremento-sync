@@ -1,0 +1,22 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+      - run: pip install -r requirements-dev.txt
+      - run: git clone --depth 1 https://github.com/BaskovicP/Incremento vendor/incremento
+      - run: python -m pytest -q
+        env:
+          INCREMENTO_DIR: vendor/incremento
+          QT_QPA_PLATFORM: offscreen
+      - run: python tools/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: incremento_sync.ankiaddon
+          path: dist/incremento_sync.ankiaddon

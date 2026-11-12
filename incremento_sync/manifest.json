@@ -1,0 +1,6 @@
+{
+    "package": "incremento_sync",
+    "name": "Incremento Sync",
+    "homepage": "https://github.com/lukasheber/incremento-sync",
+    "min_point_version": 250900
+}
