@@ -1,8 +1,8 @@
 # Incremento Sync
 
 An Anki add-on that syncs [Incremento](https://github.com/BaskovicP/Incremento)'s own data between devices:
-priorities, the knowledge tree, reader bookmarks and positions, highlights, links between documents, local files and the
-documents themselves. Anki's own sync (AnkiWeb) carries the cards; this carries what Incremento keeps beside them.
+priorities, the knowledge tree, reader bookmarks and positions, highlights, links between documents, local files, video
+files with their subtitles, and the PDF and EPUB documents themselves. (Audio topics are Anki media, which AnkiWeb syncs.) Anki's own sync (AnkiWeb) carries the cards; this carries what Incremento keeps beside them.
 
 It runs from a shared folder (Dropbox, Syncthing, a network drive…) or through a small hub on your own network, and it is
 what the Android app [Ankrimento](https://github.com/lukasheber/Ankrimento) uses to stay in step with desktop.
