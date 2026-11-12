@@ -9,19 +9,31 @@ file it reads, so a hub is only a place to put files: it cannot make a device ac
 On a machine that is on while you study (any computer with Python 3.13 or later; nothing to install):
 
 ```
-python scripts/sync_hub.py --keys hub-keys.json pair phone --host 192.168.1.20
-python scripts/sync_hub.py --keys hub-keys.json pair desktop --host 192.168.1.20
 python scripts/sync_hub.py --keys hub-keys.json serve ~/IncrementoHub
 ```
 
-`pair` prints a pairing code for the device. Enter it in the device:
+The hub shows a six digit code:
+
+```
+  Pairing code:  483 920
+```
+
+Type it on the device:
 
 - Anki desktop: Incremento sync dialog, **Use a hub…**.
 - Ankrimento: Incremento settings, **This device**, **Sync hub**.
 
-Devices can be paired while the hub runs. `devices` lists them and `revoke` removes one, at once. Keep the keys file
-out of the served folder and out of any cloud folder. The hub needs its port reachable from the devices (default
-8765); the firewall may ask the first time.
+The device finds the hub on the network by itself. If it cannot (a guest network that keeps devices apart, for
+instance), type the hub's address after the code, as the hub prints it: `483 920 192.168.1.20:8765`. Press Enter in
+the hub's window for a new code to pair another device. A code is good for one device, five minutes and three wrong
+tries; the device's real key is made by the hub and handed over inside that exchange, so no key is ever typed or shown.
+
+`devices` lists the paired devices and `revoke` removes one, at once (the device is then told to pair again). Keep the
+keys file out of the served folder and out of any cloud folder. The hub needs its port reachable from the devices
+(default 8765, and UDP 8766 for finding it); the firewall may ask the first time.
+
+For networks where a device cannot find the hub at all there is the long way: `pair NAME --host ADDRESS` prints a
+pairing code for the device to copy, which a device accepts in place of the six digits.
 
 A hub paired with a device replaces that device's sync folder. Pairing a device that already has data with an
 empty hub makes it publish everything it has, with the documents.
@@ -59,7 +71,14 @@ All under `/v1`, the path in the `path` query parameter (`/`-separated, relative
 | `PUT /v1/file?path=<rel>` | replaces the file atomically; `Content-Length` required; 204 |
 | `DELETE /v1/file?path=<rel>` | 204, also when there is nothing to delete |
 
-The pairing code is `ihub1-` + the URL-safe base64 of `[1, host, port, identity, key-hex]` + `-` + a 6-character
+The six digit code works like this: the device connects with a public pairing key (an encrypted channel and nothing
+more) and sends an HMAC of the code bound to that very TLS connection (its `tls-unique` channel binding), so a proof
+cannot be replayed on another connection and someone in the middle, holding two different connections, cannot make
+either side's proof verify. The hub answers with its own proof, then the device's key. The code is random, valid for
+five minutes, used once, and the window closes after three wrong proofs, so a guess has about a three in a million
+chance. Only a hub that is showing a code answers the device's broadcast.
+
+The long pairing code is `ihub1-` + the URL-safe base64 of `[1, host, port, identity, key-hex]` + `-` + a 6-character
 check. It contains the key, so treat it like a password.
 
 ## Not covered
