@@ -4,11 +4,14 @@ The hub serves one folder to the devices you pair with it, so a phone and a comp
 without a cloud folder. It needs only Python 3.13 or later and no installation; run it on any machine that is on
 while you study.
 
-    python scripts/sync_hub.py --keys hub-keys.json pair phone --host 192.168.1.20
     python scripts/sync_hub.py --keys hub-keys.json serve ~/IncrementoHub
 
-``pair`` prints a pairing code for the device (copy it into the device's sync settings). Devices can be paired
-while the hub runs. Each device can change only its own device folder; who owns which is kept in a file beside
+``serve`` shows a six digit code: type it on the device (Incremento settings → This device → Sync hub). The device
+finds the hub on the network by itself; press Enter in this window for a new code to pair another device. A code is
+good for one device, a few minutes and three wrong tries.
+
+``pair`` is the long way: it prints a pairing code for a device to copy (``--host`` is this machine's address as the
+device reaches it), for networks where a device cannot find the hub by itself. Each device can change only its own device folder; who owns which is kept in a file beside
 the keys file. The hub also answers paired devices that ask the local network where it is (UDP, port 8766;
 ``--no-discovery`` turns that off), so a device finds it again when its address changes. ``devices`` lists the paired devices and ``revoke`` removes one, which takes effect at once. Keep
 the keys file out of the served folder and out of any cloud folder: whoever has a key can read and change the data.
@@ -17,7 +20,9 @@ the keys file out of the served folder and out of any cloud folder: whoever has 
 from __future__ import annotations
 
 import argparse
+import socket
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "incremento_sync" / "engine"))
@@ -25,6 +30,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "incremento_sync" /
 import sync_http  # noqa: E402
 
 DEFAULT_PORT = 8765
+
+
+def _own_address() -> str:
+    """This machine's address on the network, as a device would reach it ("" if it cannot tell)."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))  # no packet is sent; the system only picks the interface it would use
+        return str(probe.getsockname()[0])
+    except OSError:
+        return ""
+    finally:
+        probe.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -74,13 +91,33 @@ def main(argv: list[str] | None = None) -> int:
         owners = options.keys.with_name(options.keys.stem + "-owners.json")  # who owns which device folder
         hub = sync_http.Hub(options.folder, book.as_mapping(), host=options.host, port=options.port,
                             state_path=owners,
-                            discovery_port=None if options.no_discovery else options.discovery_port)
+                            discovery_port=None if options.no_discovery else options.discovery_port, key_book=book)
         hub.start()
     except (sync_http.StoreError, OSError) as error:
         print(error, file=sys.stderr)
         return 1
     print(f"Serving {options.folder} on {options.host}:{hub.port} for {len(book.devices())} device(s). Ctrl+C stops it.",
           flush=True)
+    address = _own_address()
+
+    def show_code() -> None:
+        pin = sync_http.format_pin(hub.open_pairing())
+        minutes = int(sync_http.PAIRING_SECONDS // 60)
+        print()
+        print(f"  Pairing code:  {pin}")
+        print(f"  Enter it on the device (Incremento settings > This device > Sync hub). Good for one device, {minutes} minutes.")
+        print(f"  If the device cannot find this hub, type the address too:  {pin} {address or '<this computer>'}:{hub.port}")
+        print("  Press Enter here for a new code.", flush=True)
+
+    def wait_for_enter() -> None:
+        for _ in sys.stdin:  # ends at once when the hub runs without a terminal
+            show_code()
+
+    if not book.devices():
+        show_code()
+    else:
+        print("Press Enter to pair a new device.", flush=True)
+    threading.Thread(target=wait_for_enter, daemon=True).start()
     try:
         hub._thread.join()  # type: ignore[union-attr]
     except KeyboardInterrupt:

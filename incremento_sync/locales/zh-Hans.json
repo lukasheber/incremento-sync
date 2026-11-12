@@ -16,7 +16,7 @@
  "admin_sync_folder": "同步文件夹",
  "admin_sync_hub": "使用同步中心…",
  "admin_sync_hub_label": "同步中心（以 {device} 配对）",
- "admin_sync_hub_prompt": "粘贴运行同步中心的电脑上 scripts/sync_hub.py 输出的配对码。",
+ "admin_sync_hub_prompt": "输入运行同步中心的电脑上显示的 6 位数字码（用 scripts/sync_hub.py serve 启动）。如果找不到中心，请在码后面加上它的地址，例如：483 920 192.168.1.5",
  "admin_sync_keep_mine": "保留本机的版本",
  "admin_sync_last_synced": "上次同步：{time}。",
  "admin_sync_local_only": "主题排程、知识树、写作、预设和统计数据目前仍保留在各自的电脑上。",

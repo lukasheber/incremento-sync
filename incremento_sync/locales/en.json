@@ -16,7 +16,7 @@
  "admin_sync_folder": "Sync folder",
  "admin_sync_hub": "Use a hub…",
  "admin_sync_hub_label": "Hub (paired as {device})",
- "admin_sync_hub_prompt": "Paste the pairing code printed by scripts/sync_hub.py on the machine that runs the hub.",
+ "admin_sync_hub_prompt": "Type the 6-digit code the sync hub shows on the computer that runs it (start it with scripts/sync_hub.py serve). If it cannot find the hub, add its address after the code, for example: 483 920 192.168.1.5",
  "admin_sync_keep_mine": "Keep this computer's version",
  "admin_sync_last_synced": "Last synced {time}.",
  "admin_sync_local_only": "Topic schedules, the knowledge tree, writing, presets and statistics stay on each computer for now.",

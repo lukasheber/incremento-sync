@@ -16,7 +16,7 @@
  "admin_sync_folder": "Mapa za sinkronizaciju",
  "admin_sync_hub": "Koristi središte…",
  "admin_sync_hub_label": "Središte (upareno kao {device})",
- "admin_sync_hub_prompt": "Zalijepite kod za uparivanje koji ispisuje scripts/sync_hub.py na računalu na kojem radi središte.",
+ "admin_sync_hub_prompt": "Upišite 6-znamenkasti kod koji sinkronizacijski hub prikazuje na računalu na kojem radi (pokrenite ga s scripts/sync_hub.py serve). Ako ne može pronaći hub, dodajte njegovu adresu iza koda, npr.: 483 920 192.168.1.5",
  "admin_sync_keep_mine": "Zadrži verziju s ovog računala",
  "admin_sync_last_synced": "Zadnja sinkronizacija: {time}.",
  "admin_sync_local_only": "Raspored tema, stablo znanja, pisanje, predlošci i statistika zasad ostaju na svakom računalu.",

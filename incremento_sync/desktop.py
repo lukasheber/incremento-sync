@@ -82,6 +82,14 @@ def _profile() -> str:
     return loader.module("paths").get_active_profile()
 
 
+def _device_name() -> str:
+    """This computer's name as a hub device name (letters, digits, dashes)."""
+    import re
+    import socket
+
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", socket.gethostname()).strip("-")[:60] or "desktop"
+
+
 def _profile_name() -> str:
     getter = getattr(_incremento, "_current_profile_name", None)
     try:
@@ -123,7 +131,9 @@ class _Controller:
         _service().configure(_addon_dir, self.profile, folder, query=mw.col.db.all)
 
     def configure_hub(self, code: str) -> None:
-        _service().configure_hub(_addon_dir, self.profile, code, query=mw.col.db.all)
+        # A six digit code the hub shows (found on the network), or a long pairing code.
+        pairing = loader.module("sync_http").resolve_pairing(code, _device_name())
+        _service().configure_hub(_addon_dir, self.profile, pairing.code(), query=mw.col.db.all)
 
     def disable(self) -> None:
         _service().disable(_addon_dir, self.profile)

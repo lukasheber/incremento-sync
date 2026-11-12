@@ -65,6 +65,15 @@ DISCOVERY_PORT = 8766
 _DISCOVERY_REQUEST = b"IHUB1 "
 _DISCOVERY_REPLY = b"IHUB1R "
 _HEX = re.compile(rb"^[0-9a-f]{16,64}$")
+DEFAULT_PORT = 8765
+PAIRING_SECONDS = 300.0
+PAIRING_ATTEMPTS = 3
+#: Not a secret: it only gives the pairing exchange an encrypted channel; the code decides who may pair.
+PAIRING_IDENTITY = "ihub-pairing"
+PAIRING_KEY = hashlib.sha256(b"incremento-hub-pairing-v1").digest()
+_PAIR_QUESTION = b"IHUB1P "
+_PAIR_ANSWER = b"IHUB1PR "
+_PIN = re.compile(r"^[0-9]{6}$")
 _handshake_identity = threading.local()
 _CHUNK = 256 * 1024
 
@@ -161,6 +170,172 @@ def discover(identity: str, key: bytes, *, port: int = DISCOVERY_PORT,
     finally:
         sock.close()
     return None
+
+
+# --- Pairing with a short code ----------------------------------------------------------------------------------
+# The hub shows six digits. The device broadcasts a question that a hub answers only while it is pairing, connects
+# with the public pairing key (an encrypted channel, nothing more), and sends a proof of the code made from that very
+# connection (TLS channel binding), so it cannot be replayed on another one. The hub checks it, answers with its own
+# proof, and hands over the device's real key through the same connection. Someone in the middle holds two different
+# connections, so neither proof they relay verifies, and the code is good for three wrong tries and a few minutes.
+
+class PairingRefused(StoreError):
+    """Pairing did not happen; the message says why in words a person can act on."""
+
+
+def format_pin(pin: str) -> str:
+    return f"{pin[:3]} {pin[3:]}"
+
+
+def _client_proof(pin: str, binding: bytes, name: str) -> str:
+    return hmac.new(pin.encode("ascii"), b"ihub-pair-device|" + binding + b"|" + name.encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _hub_proof(pin: str, binding: bytes, name: str, key: bytes) -> str:
+    return hmac.new(pin.encode("ascii"), b"ihub-pair-hub|" + binding + b"|" + name.encode("utf-8") + b"|" + key,
+                    hashlib.sha256).hexdigest()
+
+
+def parse_pairing_input(text: str) -> tuple[str, str | None, int | None] | None:
+    """What a person typed: a six digit code, optionally with the hub's address (``483 920 192.168.1.5[:8765]``,
+    in either order), as ``(code, host, port)``; None when it is anything else (a long pairing code, for instance)."""
+    tokens = text.replace(",", " ").split()
+    pin_parts: list[str] = []
+    address: str | None = None
+    for token in tokens:
+        if re.fullmatch(r"[0-9]{1,6}(-[0-9]{1,6})?", token) and "." not in token and ":" not in token:
+            pin_parts.append(token.replace("-", ""))
+        elif re.fullmatch(r"[A-Za-z0-9.\-]+(:[0-9]{1,5})?", token) and address is None and not token.startswith("ihub1-"):
+            address = token
+        else:
+            return None
+    pin = "".join(pin_parts)
+    if not _PIN.match(pin):
+        return None
+    if address is None:
+        return pin, None, None
+    host, _, port = address.partition(":")
+    if not host or (port and not 0 < int(port) < 65536):
+        return None
+    return pin, host, int(port) if port else None
+
+
+def find_pairing_hubs(*, port: int = DISCOVERY_PORT, targets: tuple[str, ...] = ("255.255.255.255",),
+                      timeout: float = 2.0) -> list[tuple[str, int]]:
+    """The hubs on the network that are showing a pairing code, as (address, port)."""
+    question = _PAIR_QUESTION + secrets.token_hex(8).encode("ascii")
+    found: list[tuple[str, int]] = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(0.1)
+        deadline = time.monotonic() + timeout
+        next_question = 0.0
+        while time.monotonic() < deadline:
+            if time.monotonic() >= next_question:
+                for target in targets:
+                    try:
+                        sock.sendto(question, (target, port))
+                    except OSError:
+                        pass
+                next_question = time.monotonic() + 0.5
+            try:
+                data, address = sock.recvfrom(256)
+            except (socket.timeout, OSError):
+                continue
+            if data.startswith(_PAIR_ANSWER) and data[len(_PAIR_ANSWER):].isdigit():
+                where = (str(address[0]), int(data[len(_PAIR_ANSWER):]))
+                if 0 < where[1] < 65536 and where not in found:
+                    found.append(where)
+    finally:
+        sock.close()
+    return found
+
+
+def _pair_once(pin: str, name: str, host: str, port: int, timeout: float) -> Pairing:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_2
+    context.set_ciphers(CIPHERS)
+    context.set_psk_client_callback(lambda hint: (PAIRING_IDENTITY, PAIRING_KEY))  # type: ignore[attr-defined]
+    connection = http.client.HTTPSConnection(host, port, context=context, timeout=timeout)
+    try:
+        try:
+            connection.connect()
+            binding = connection.sock.get_channel_binding("tls-unique")  # type: ignore[union-attr]
+            body = json.dumps({"name": name, "proof": _client_proof(pin, binding, name)}).encode("utf-8")
+            connection.request("POST", "/v1/pair", body, {"Content-Type": "application/json"})
+            response = connection.getresponse()
+            data = response.read(65536)
+        except ssl.SSLError as error:
+            raise PairingRefused("The hub is not showing a code. Press Enter in the hub's window to show one.") from error
+        except (OSError, http.client.HTTPException) as error:
+            raise PairingRefused(f"Could not reach the hub at {host}:{port} ({error}).") from error
+        try:
+            reply = json.loads(data.decode("utf-8")) if data else {}
+        except ValueError:
+            reply = {}
+        if response.status == 403:
+            if reply.get("error") == "wrong code":
+                raise PairingRefused("That code is not right.")
+            raise PairingRefused("The hub is not showing a code. Press Enter in the hub's window to show one.")
+        if response.status != 200:
+            raise PairingRefused(f"The hub refused to pair (HTTP {response.status}).")
+        try:
+            given, key, answered = str(reply["name"]), bytes.fromhex(reply["key"]), str(reply["proof"])
+        except (KeyError, ValueError, TypeError):
+            raise PairingRefused("The hub's answer was not understood.") from None
+        if not _IDENTITY.match(given) or len(key) != 32 or not hmac.compare_digest(
+                answered, _hub_proof(pin, binding, given, key)):
+            raise PairingRefused("The hub did not prove that it knows the code, so nothing was paired.")
+        return Pairing(host, port, given, key)
+    finally:
+        connection.close()
+
+
+def pair_with_pin(pin: str, name: str, *, host: str | None = None, port: int | None = None,
+                  discovery_port: int = DISCOVERY_PORT, discovery_targets: tuple[str, ...] = ("255.255.255.255",),
+                  discovery_timeout: float = 2.5, timeout: float = 10.0) -> Pairing:
+    """Pair this device, to be called ``name``, with the hub that shows ``pin``; returns the pairing to keep.
+
+    Without ``host`` the hubs that are showing a code are found by broadcast. Raises ``PairingRefused``."""
+    require_psk()
+    digits = re.sub(r"[\s-]", "", pin)
+    if not _PIN.match(digits):
+        raise PairingRefused("The code is six digits.")
+    if host:
+        candidates = [(host, port or DEFAULT_PORT)]
+    else:
+        candidates = find_pairing_hubs(port=discovery_port, targets=discovery_targets, timeout=discovery_timeout)
+        if not candidates:
+            raise PairingRefused("Could not find a hub that is showing a code. Is this device on the same network as "
+                                 "the hub? You can also type the hub's address after the code.")
+    problems: list[PairingRefused] = []
+    for where in candidates:
+        try:
+            return _pair_once(digits, name, where[0], where[1], timeout)
+        except PairingRefused as refused:
+            problems.append(refused)
+    raise problems[0]
+
+
+def resolve_pairing(text: str, name: str, **options: Any) -> Pairing:
+    """A pairing from what a person typed: a six digit code (with an optional address), or a long pairing code."""
+    parsed = parse_pairing_input(text)
+    if parsed is None:
+        return Pairing.from_code(text)
+    pin, host, port = parsed
+    return pair_with_pin(pin, name, host=host, port=port, **options)
+
+
+class _PairingWindow:
+    def __init__(self, pin: str, expires: float):
+        self.pin = pin
+        self.expires = expires
+        self.attempts_left = PAIRING_ATTEMPTS
+        self.skip_proof_check = False  # tests only
 
 
 # --- The paired devices ----------------------------------------------------------------------------------------
@@ -316,7 +491,35 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     # -- methods --
 
+    def _pairing_only(self) -> bool:
+        """The public pairing key may take part in pairing and nothing else."""
+        if self.identity != PAIRING_IDENTITY:
+            return False
+        self._refuse(403, "this key is for pairing only")
+        return True
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.identity != PAIRING_IDENTITY or urlsplit(self.path).path != "/v1/pair":
+            self._refuse(404, "unknown route")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "-1"))
+            if not 0 < length <= 4096:
+                raise ValueError
+            asked = json.loads(self.rfile.read(length).decode("utf-8"))
+            name, proof = str(asked["name"]), str(asked["proof"])
+        except (ValueError, KeyError, TypeError, UnicodeError):
+            self._refuse(400, "bad pairing request")
+            return
+        binding = self.request.get_channel_binding("tls-unique")
+        status, answer = self.server.hub.handle_pairing(name, proof, binding)  # type: ignore[attr-defined]
+        if status != 200:
+            self.close_connection = True
+        self._reply(status, json.dumps(answer).encode("utf-8"))
+
     def do_GET(self) -> None:  # noqa: N802 - the base class's naming
+        if self._pairing_only():
+            return
         target = self._target()
         if target is None:
             return
@@ -362,6 +565,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 shutil.copyfileobj(stream, self.wfile, _CHUNK)
 
     def do_PUT(self) -> None:  # noqa: N802
+        if self._pairing_only():
+            return
         target = self._target()
         if target is None:
             return
@@ -407,6 +612,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._reply(204)
 
     def do_DELETE(self) -> None:  # noqa: N802
+        if self._pairing_only():
+            return
         target = self._target()
         if target is None:
             return
@@ -501,7 +708,7 @@ class Hub:
 
     def __init__(self, root: Path | str, keys: Mapping[str, bytes], *, host: str = "0.0.0.0", port: int = 0,
                  state_path: Path | str | None = None, max_connections: int = DEFAULT_MAX_CONNECTIONS,
-                 discovery_port: int | None = None):
+                 discovery_port: int | None = None, key_book: KeyBook | None = None):
         if isinstance(keys, dict):
             for identity, key in keys.items():
                 if not _IDENTITY.match(identity) or len(key) < 16:
@@ -509,6 +716,9 @@ class Hub:
         self.root = Path(root)
         self._store = LocalStore(self.root)
         self._keys = keys  # not copied: a live view of the key book sees devices paired later
+        self._book = key_book
+        self._pairing: _PairingWindow | None = None
+        self._pairing_lock = threading.Lock()
         self._host, self._port = host, port
         self._state_path = None if state_path is None else Path(state_path)
         self._max_connections = max_connections
@@ -524,6 +734,51 @@ class Hub:
         if self._server is None:
             return self._port
         return int(self._server.server_address[1])
+
+    # -- Pairing with a short code --
+
+    @property
+    def pairing_open(self) -> bool:
+        with self._pairing_lock:
+            window = self._pairing
+            return window is not None and time.monotonic() < window.expires and window.attempts_left > 0
+
+    def open_pairing(self, seconds: float = PAIRING_SECONDS) -> str:
+        """Start accepting one device with a new six digit code, which this returns; a window already open is replaced."""
+        if self._book is None:
+            raise ValueError("this hub has no key book to add devices to")
+        pin = f"{secrets.randbelow(1_000_000):06d}"
+        with self._pairing_lock:
+            self._pairing = _PairingWindow(pin, time.monotonic() + seconds)
+        return pin
+
+    def close_pairing(self) -> None:
+        with self._pairing_lock:
+            self._pairing = None
+
+    def handle_pairing(self, name: str, proof: str, binding: bytes) -> tuple[int, dict[str, Any]]:
+        """A device's pairing request (see ``_Handler.do_POST``): (HTTP status, JSON answer)."""
+        with self._pairing_lock:
+            window = self._pairing
+            if (window is None or time.monotonic() >= window.expires or window.attempts_left <= 0
+                    or self._book is None or self._server is None):
+                return 403, {"error": "pairing is not open"}
+            if not window.skip_proof_check and not hmac.compare_digest(proof, _client_proof(window.pin, binding, name)):
+                window.attempts_left -= 1
+                if window.attempts_left <= 0:
+                    self._pairing = None
+                return 403, {"error": "wrong code"}
+            base = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-")[:56] or "device"
+            taken = set(self._book.devices())
+            chosen, number = base, 1
+            while chosen in taken:
+                number += 1
+                chosen = f"{base}-{number}"
+            key = self._book.add(chosen)
+            pin = window.pin
+            self._pairing = None  # one code, one device
+            return 200, {"name": chosen, "key": key.hex(), "port": int(self._server.server_address[1]),
+                         "proof": _hub_proof(pin, binding, chosen, key)}
 
     @property
     def discovery_port(self) -> int | None:
@@ -541,6 +796,13 @@ class Hub:
                 # stopping the hub ends this thread.
                 if self._stopping.is_set():
                     return
+                continue
+            if data.startswith(_PAIR_QUESTION) and len(data) <= 100:
+                if self.pairing_open and self._server is not None:  # only while a code is showing
+                    try:
+                        sock.sendto(_PAIR_ANSWER + str(self._server.server_address[1]).encode("ascii"), address)
+                    except OSError:
+                        pass
                 continue
             if len(data) > 200 or not data.startswith(_DISCOVERY_REQUEST):
                 continue
@@ -569,6 +831,8 @@ class Hub:
 
         def lookup(identity: str | None) -> bytes:
             _handshake_identity.value = identity
+            if identity == PAIRING_IDENTITY:  # the public key, and only while a code is showing
+                return PAIRING_KEY if self.pairing_open else b""
             key = keys.get(identity or "", b"")
             return key if len(key) >= 16 else b""  # empty: unknown identity, the handshake fails
 
@@ -580,6 +844,7 @@ class Hub:
             return
         self._server = _Server((self._host, self._port), self._store, self._context(),
                                state_path=self._state_path, max_connections=self._max_connections)
+        self._server.hub = self  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, name="incremento-hub", daemon=True)
         self._thread.start()
         if self._discovery_wanted is not None:

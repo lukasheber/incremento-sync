@@ -178,3 +178,40 @@ def test_discovery_can_be_switched_off(tmp_path):
     finally:
         server.terminate()
         server.communicate(timeout=10)
+
+
+def test_serve_shows_a_pairing_code_when_nobody_is_paired_and_a_new_one_on_enter(tmp_path):
+    import re
+    import subprocess
+    import sys
+
+    process = subprocess.Popen(
+        [sys.executable, str(SCRIPT), "--keys", str(tmp_path / "keys.json"), "serve", str(tmp_path / "Hub"),
+         "--host", "127.0.0.1", "--port", "0", "--no-discovery"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        first = _read_until(process, r"Pairing code:\s+(\d{3} \d{3})")
+        process.stdin.write("\n")
+        process.stdin.flush()
+        second = _read_until(process, r"Pairing code:\s+(\d{3} \d{3})")
+    finally:
+        process.kill()
+        process.wait()
+
+    assert re.fullmatch(r"\d{3} \d{3}", first) and re.fullmatch(r"\d{3} \d{3}", second)
+
+
+def _read_until(process, pattern):
+    import re
+    import time
+
+    seen, deadline = "", time.monotonic() + 20
+    while time.monotonic() < deadline:
+        line = process.stdout.readline()
+        if not line:
+            break
+        seen += line
+        match = re.search(pattern, seen)
+        if match:
+            return match.group(1)
+    raise AssertionError(f"never saw {pattern!r} in:\n{seen}")
