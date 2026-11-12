@@ -448,3 +448,10 @@ def test_a_hub_that_is_off_is_reported_in_words_a_person_can_act_on():
 
     with pytest.raises(StoreError, match="Can't reach the sync hub at 127.0.0.1:9"):
         store.listdir("")
+
+
+def test_a_device_the_hub_does_not_know_is_told_to_pair_again(hub):
+    store = HttpStore("127.0.0.1", hub.port, "removed-phone", KEY, timeout=3, discovery_port=None)
+
+    with pytest.raises(StoreError, match="did not accept this device"):
+        store.listdir("")

@@ -949,7 +949,11 @@ class HttpStore:
             except (OSError, http.client.HTTPException) as error:
                 self._drop()
                 failure = StoreError(f"{method} {target.split('?')[0]}: {error}")
-                if connecting and isinstance(error, OSError) and not isinstance(error, ssl.SSLError):
+                if connecting and isinstance(error, (ssl.SSLError, ConnectionResetError, ConnectionAbortedError)):
+                    # The hub is there and hung up during the handshake: it does not know this device's key.
+                    failure = StoreError(f"The hub at {self._host}:{self._port} did not accept this device. It may have "
+                                         "been removed from the hub: pair it again with a new code.")
+                elif connecting and isinstance(error, OSError):
                     failure = StoreError(f"Can't reach the sync hub at {self._host}:{self._port} ({error}). "
                                          "Is the computer on, on the same network, and the hub running?")
                 if isinstance(error, ssl.SSLError):
