@@ -7,9 +7,10 @@ It extends the Incremento add-on while it is switched on and puts everything bac
 from __future__ import annotations
 
 try:
-    from aqt import gui_hooks, mw
+    from aqt import gui_hooks
+    from aqt.qt import QAction  # noqa: F401  (only a real Anki has Qt)
 except ImportError:  # the phone's runtime loads ``loader`` itself, without Qt
-    gui_hooks = mw = None
+    gui_hooks = None
 
 if gui_hooks is not None:
     from . import desktop
