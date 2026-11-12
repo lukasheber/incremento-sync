@@ -56,6 +56,8 @@ CIPHERS = "ECDHE-PSK-CHACHA20-POLY1305:PSK-AES256-GCM-SHA384"
 MAX_BODY_BYTES = 512 * 1024 * 1024
 MAX_LISTING_BYTES = 16 * 1024 * 1024
 HANDSHAKE_SECONDS = 10.0
+#: How long to wait for a hub to answer at all; a hub that is on answers at once, and one that is off should say so soon.
+CONNECT_SECONDS = 8.0
 IDLE_SECONDS = 60.0
 _IDENTITY = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # Below a device folder only the device that first wrote there may write or delete.
@@ -915,8 +917,11 @@ class HttpStore:
 
     def _connect(self) -> http.client.HTTPSConnection:
         if self._connection is None:
-            self._connection = http.client.HTTPSConnection(self._host, self._port, context=self._context(),
-                                                           timeout=self._timeout)
+            connection = http.client.HTTPSConnection(self._host, self._port, context=self._context(),
+                                                     timeout=min(self._timeout, CONNECT_SECONDS))
+            connection.connect()
+            connection.sock.settimeout(self._timeout)  # type: ignore[union-attr]
+            self._connection = connection
         return self._connection
 
     @property
@@ -934,6 +939,7 @@ class HttpStore:
         retried = searched = False
         while True:
             reused = self._connection is not None
+            connecting = not reused
             try:
                 connection = self._connect()
                 if hasattr(body, "seek"):
@@ -943,6 +949,9 @@ class HttpStore:
             except (OSError, http.client.HTTPException) as error:
                 self._drop()
                 failure = StoreError(f"{method} {target.split('?')[0]}: {error}")
+                if connecting and isinstance(error, OSError) and not isinstance(error, ssl.SSLError):
+                    failure = StoreError(f"Can't reach the sync hub at {self._host}:{self._port} ({error}). "
+                                         "Is the computer on, on the same network, and the hub running?")
                 if isinstance(error, ssl.SSLError):
                     raise failure from error
                 if reused and not retried:

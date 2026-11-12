@@ -441,3 +441,10 @@ def test_a_wrong_key_is_not_mistaken_for_a_moved_hub(findable_hub):
     with pytest.raises(StoreError):
         store.read("x", 10)
     assert store.address == ("127.0.0.1", findable_hub.port)
+
+
+def test_a_hub_that_is_off_is_reported_in_words_a_person_can_act_on():
+    store = HttpStore("127.0.0.1", 9, "phone", KEY, timeout=2, discovery_port=None)
+
+    with pytest.raises(StoreError, match="Can't reach the sync hub at 127.0.0.1:9"):
+        store.listdir("")
