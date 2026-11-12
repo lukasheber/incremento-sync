@@ -106,7 +106,8 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print(f"  Pairing code:  {pin}")
         print(f"  Enter it on the device (Incremento settings > This device > Sync hub). Good for one device, {minutes} minutes.")
-        print(f"  If the device cannot find this hub, type the address too:  {pin} {address or '<this computer>'}:{hub.port}")
+        where = f"{address or '<this computer>'}" + ("" if hub.port == DEFAULT_PORT else f":{hub.port}")
+        print(f"  If the device cannot find this hub, type the address after a comma:  {pin.replace(' ', '')},{where}")
         print("  Press Enter here for a new code.", flush=True)
 
     def wait_for_enter() -> None:

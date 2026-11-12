@@ -24,7 +24,7 @@ Type it on the device:
 - Ankrimento: Incremento settings, **This device**, **Sync hub**.
 
 The device finds the hub on the network by itself. If it cannot (a guest network that keeps devices apart, for
-instance), type the hub's address after the code, as the hub prints it: `483 920 192.168.1.20:8765`. Press Enter in
+instance), type the hub's address after a comma, as the hub prints it: `483920,192.168.1.20`. Press Enter in
 the hub's window for a new code to pair another device. A code is good for one device, five minutes and three wrong
 tries; the device's real key is made by the hub and handed over inside that exchange, so no key is ever typed or shown.
 
