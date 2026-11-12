@@ -30,6 +30,7 @@ try:
     from .sync_capture import adopt_new_device_identity, capture, enable_sync, sync_identity
     from .sync_documents import DocumentFamily
     from .sync_files import LocalFileFamily
+    from .sync_videos import VideoFileFamily
     from .sync_links import LINK_FAMILIES
     from .sync_blobs import Budget
     from .sync_exchange import EXCHANGE_DIR, announce, publish, receive, release_waiting, sample_card_refs
@@ -48,6 +49,7 @@ except ImportError:
     )
     from sync_documents import DocumentFamily  # type: ignore[no-redef]
     from sync_files import LocalFileFamily  # type: ignore[no-redef]
+    from sync_videos import VideoFileFamily  # type: ignore[no-redef]
     from sync_links import LINK_FAMILIES  # type: ignore[no-redef]
     from sync_blobs import Budget  # type: ignore[no-redef]
     from sync_exchange import (  # type: ignore[no-redef]
@@ -129,13 +131,15 @@ _locks: dict[tuple[str, str], threading.Lock] = {}
 _locks_guard = threading.Lock()
 _document_families: dict[tuple[str, str], DocumentFamily] = {}
 _file_families: dict[tuple[str, str], LocalFileFamily] = {}
+_video_families: dict[tuple[str, str], VideoFileFamily] = {}
 
 
 def families_for(addon_dir: str, profile: str) -> dict[str, Family]:
     with _locks_guard:
         documents = _document_families.setdefault((addon_dir, profile), DocumentFamily(addon_dir, profile))
         files = _file_families.setdefault((addon_dir, profile), LocalFileFamily(addon_dir, profile))
-    return {**FAMILIES, **LINK_FAMILIES, "document": documents, "localfile": files}
+        videos = _video_families.setdefault((addon_dir, profile), VideoFileFamily(addon_dir, profile))
+    return {**FAMILIES, **LINK_FAMILIES, "document": documents, "localfile": files, "video": videos}
 
 
 def _meta(conn: Any, key: str) -> str | None:
@@ -281,6 +285,7 @@ def _run(addon_dir: str, profile: str, folder: Store, query: Query, is_current: 
     families = families_for(addon_dir, profile)
     # Local file cards exist only as Anki notes: this family reads them through the run's collection.
     families["localfile"].query = query  # type: ignore[attr-defined]
+    families["video"].query = query  # type: ignore[attr-defined]
     store = sync_paths.get_sync_blob_dir(addon_dir, profile)
     usn, scm = collection_usn(query), collection_scm(query)
     state = f"{scm}:{query('SELECT mod FROM col')[0][0]}"
