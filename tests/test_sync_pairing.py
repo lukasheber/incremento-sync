@@ -198,6 +198,7 @@ def test_the_text_a_person_types_is_either_a_code_with_an_optional_address_or_a_
     assert sync_http.parse_pairing_input("483 920") == ("483920", None, None)
     assert sync_http.parse_pairing_input("483-920 192.168.1.5") == ("483920", "192.168.1.5", None)
     assert sync_http.parse_pairing_input("483920 192.168.1.5:8800") == ("483920", "192.168.1.5", 8800)
+    assert sync_http.parse_pairing_input("483920,192.168.1.5") == ("483920", "192.168.1.5", None)  # a phone's number pad
     assert sync_http.parse_pairing_input("192.168.1.5:8800 483920") == ("483920", "192.168.1.5", 8800)
     assert sync_http.parse_pairing_input("ihub1-abc-def") is None
     assert sync_http.parse_pairing_input("hello") is None
