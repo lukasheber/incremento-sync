@@ -29,7 +29,7 @@ import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 REPO = Path(__file__).resolve().parents[1]
 RECT = {"x": 72.0, "y": 72.0, "w": 200.0, "h": 14.0}
@@ -320,8 +320,18 @@ def two_devices(workdir: Path) -> int:
 # --- Device B in another Python ------------------------------------------------------
 
 def _wsl_path(path: Path) -> str:
-    resolved = str(Path(path).resolve())
-    return "/mnt/" + resolved[0].lower() + resolved[2:].replace("\\", "/")
+    """A Windows path as WSL sees it (``C:/x/y``, or with backslashes, is ``/mnt/c/x/y``); a relative path is made
+    absolute first.
+
+    Read as a Windows path whatever system this runs on: on Linux, ``resolve()`` would take ``C:/x`` for a relative
+    path and put the working directory in front of it.
+    """
+    windows = PureWindowsPath(path)
+    if not windows.drive:
+        windows = PureWindowsPath(Path(path).resolve())
+    if not windows.drive:
+        raise ValueError(f"{path} has no drive letter, so WSL cannot reach it under /mnt")
+    return "/".join(["/mnt", windows.drive.rstrip(":").lower(), *windows.parts[1:]])
 
 
 class RemoteDevice:

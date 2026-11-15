@@ -60,3 +60,5 @@ def test_a_directory_made_by_an_earlier_run_is_cleared_for_the_next(tmp_path):
 
 def test_windows_paths_are_translated_for_a_device_inside_wsl():
     assert sync_e2e._wsl_path(Path("C:/Users/me/Cloud Folder")) == "/mnt/c/Users/me/Cloud Folder"
+    assert sync_e2e._wsl_path(Path(r"D:\Sync\run")) == "/mnt/d/Sync/run"
+    assert sync_e2e._wsl_path("C:\\") == "/mnt/c"
