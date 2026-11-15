@@ -241,3 +241,29 @@ def test_the_device_proof_is_bound_to_the_connection(hub):
                 reply += chunk
 
     assert b" 403 " in reply.split(b"\r\n")[0]
+
+
+def test_pairing_and_syncing_work_inside_anki_where_truststore_replaces_ssl_contexts(book, tmp_path):
+    """Anki calls truststore.inject_into_ssl() at startup. Its SSLContext does not forward the PSK callbacks, so a
+    hub or client built on it failed every handshake ("no ciphers available") and showed "not showing a code"."""
+    truststore = pytest.importorskip("truststore")
+    truststore.inject_into_ssl()
+    try:
+        assert ssl.SSLContext.__module__ != "ssl"  # replaced, as in Anki
+        root = tmp_path / "AnkiHub"
+        root.mkdir()
+        server = Hub(root, book.as_mapping(), host="127.0.0.1", port=0, key_book=book)  # built after the injection
+        server.start()
+        try:
+            pairing = _pair(server, server.open_pairing())
+            store = HttpStore.from_pairing(pairing)
+            try:
+                store.write("hello.txt", b"hi")
+                assert store.read("hello.txt", 10) == b"hi"
+            finally:
+                store.close()
+        finally:
+            server.stop()
+    finally:
+        truststore.extract_from_ssl()
+    assert ssl.SSLContext.__module__ == "ssl"

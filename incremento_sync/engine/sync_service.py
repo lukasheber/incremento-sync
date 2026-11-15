@@ -114,6 +114,8 @@ class SyncStatus:
     waiting_for_parents: int
     #: Changes that have waited longer than STALE_WAITING_SECONDS.
     stale_waiting: int = 0
+    #: When this computer last put changes of its own in the sync location (None: never).
+    last_published: int | None = None
 
 
 @dataclass(frozen=True)
@@ -365,7 +367,9 @@ def _hub_path(addon_dir: str, profile: str) -> Path:
 
 
 def store_for(addon_dir: str, profile: str, label: str) -> Store:
-    """The store a profile was configured with: a hub paired earlier, or a folder."""
+    """The store a profile was configured with: a hub paired earlier, this computer's own phone folder, or a folder."""
+    if label.startswith("phone:"):
+        return LocalStore(Path(label[len("phone:"):]))
     if not label.startswith("hub:"):
         return LocalStore(Path(label))
     try:
@@ -459,10 +463,12 @@ def status(addon_dir: str, profile: str, *, now: float | None = None) -> SyncSta
     counts = dict(conn.execute("SELECT status, count(*) FROM sync_inbox GROUP BY status").fetchall())
     last = _meta(conn, "last_sync")
     open_conflicts = conn.execute("SELECT count(*) FROM sync_conflicts WHERE resolved_revision IS NULL").fetchone()[0]
+    published = conn.execute("SELECT max(published_at) FROM sync_outbox").fetchone()[0]
     return SyncStatus(configured=configured, folder=_meta(conn, "folder"),
                       last_sync=int(last) if last is not None else None, conflicts=open_conflicts,
                       waiting_for_anki=counts.get("pending_anki", 0), waiting_for_files=counts.get("pending_blob", 0),
-                      waiting_for_parents=counts.get("pending_parent", 0), stale_waiting=stale)
+                      waiting_for_parents=counts.get("pending_parent", 0), stale_waiting=stale,
+                      last_published=int(published) if published is not None else None)
 
 
 def discard_stale(addon_dir: str, profile: str, *, now: float | None = None) -> int:

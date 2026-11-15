@@ -1,18 +1,47 @@
-# Sync through a hub on your network
+# Sync with your phone (a hub on your network)
 
 A hub lets devices that share no cloud folder (a phone and a computer on one network) exchange Incremento data.
 It is the same exchange as a shared folder, reached over the network. The engine on each device validates every
 file it reads, so a hub is only a place to put files: it cannot make a device accept bad data.
 
-## Using it
+## Anki as the hub (the usual way)
 
-On a machine that is on while you study (any computer with Python 3.13 or later; nothing to install):
+In Anki choose *Incremento → Sync Incremento Data…* and press **Set up phone sync**. This computer becomes the hub:
+
+- the window shows a six digit code, good for one phone, five minutes and three wrong tries (**New code** shows another);
+- on the phone open Ankrimento → Incremento settings → This device → Sync hub and type the code. The phone finds the
+  computer on the network by itself; if it cannot (a guest network that keeps devices apart, for instance), type this
+  computer's address after a comma, as the window shows it: `483920,192.168.1.20`;
+- once the phone is paired the code goes away and the window shows the status instead: when each phone last synced
+  and whether it has this computer's newest changes, whether the phone's newest changes are still on their way here,
+  changes waiting for cards from AnkiWeb, conflicts to decide, and a sync that failed. **Pair another phone**,
+  **Remove a phone…** and **Stop phone sync** are below it.
+
+Nobody has to press anything to keep in step. The phone sends and receives when it syncs (after its AnkiWeb sync, or
+with Sync now in its Incremento menu). The computer takes in what a phone sent within half a minute, and sends its own
+changes every five minutes while phones are served, after AnkiWeb syncs, and when the profile closes. The hub notes
+when each phone last made a request and last changed a file (`user_files/sync/phone-activity.json`); "has this
+computer's newest changes" means the phone synced after this computer last sent changes.
+
+Anki serves the phones only while it is open, and the profile that is open. The first time, the firewall may ask
+whether to let Anki use the network: allow it on private networks. The server uses port 8765 (and UDP 8766 for being
+found), or another free port if 8765 is taken. The computer syncs against the served folder directly (it is the profile's
+`user_files/sync/phone-hub`), so nothing goes over the network for itself. The keys are kept beside that folder, not in
+it, and are skipped by exports and backups with the rest of the `sync` folder.
+
+A profile syncs one way at a time: phone sync, a cloud folder, or another computer's hub. *Stop syncing* frees it; the
+paired phones stay paired and the data is kept.
+
+## A hub on another computer (advanced)
+
+For a machine that is on while you study and is not the one you run Anki on, run the standalone hub (any computer with
+Python 3.13 or later; nothing to install):
 
 ```
 python scripts/sync_hub.py --keys hub-keys.json serve ~/IncrementoHub
 ```
 
-The hub shows a six digit code:
+It shows a six digit code, like Anki does:
 
 ```
   Pairing code:  483 920
@@ -20,13 +49,12 @@ The hub shows a six digit code:
 
 Type it on the device:
 
-- Anki desktop: Incremento sync dialog, **Use a hub…**.
+- Anki desktop: Incremento sync dialog, **Advanced: use another computer as the server…**.
 - Ankrimento: Incremento settings, **This device**, **Sync hub**.
 
-The device finds the hub on the network by itself. If it cannot (a guest network that keeps devices apart, for
-instance), type the hub's address after a comma, as the hub prints it: `483920,192.168.1.20`. Press Enter in
-the hub's window for a new code to pair another device. A code is good for one device, five minutes and three wrong
-tries; the device's real key is made by the hub and handed over inside that exchange, so no key is ever typed or shown.
+Press Enter in the hub's window for a new code to pair another device. A code is good for one device, five minutes and
+three wrong tries; the device's real key is made by the hub and handed over inside that exchange, so no key is ever typed
+or shown.
 
 `devices` lists the paired devices and `revoke` removes one, at once (the device is then told to pair again). Keep the
 keys file out of the served folder and out of any cloud folder. The hub needs its port reachable from the devices
@@ -35,8 +63,8 @@ keys file out of the served folder and out of any cloud folder. The hub needs it
 For networks where a device cannot find the hub at all there is the long way: `pair NAME --host ADDRESS` prints a
 pairing code for the device to copy, which a device accepts in place of the six digits.
 
-A hub paired with a device replaces that device's sync folder. Pairing a device that already has data with an
-empty hub makes it publish everything it has, with the documents.
+A hub paired with a device replaces that device's sync folder. Pairing a device that already has data with an empty hub
+makes it publish everything it has, with the documents.
 
 ## What protects the data
 

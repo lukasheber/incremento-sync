@@ -32,10 +32,12 @@ import hmac
 import http.client
 import http.server
 import json
+import os
 import re
 import secrets
 import shutil
 import socket
+import _ssl
 import ssl
 import tempfile
 import threading
@@ -76,6 +78,7 @@ PAIRING_KEY = hashlib.sha256(b"incremento-hub-pairing-v1").digest()
 _PAIR_QUESTION = b"IHUB1P "
 _PAIR_ANSWER = b"IHUB1PR "
 _PIN = re.compile(r"^[0-9]{6}$")
+_NOT_SHOWING = "The computer is not showing a pairing code any more. Show a new code there and try again."
 _handshake_identity = threading.local()
 _CHUNK = 256 * 1024
 
@@ -84,6 +87,28 @@ def require_psk() -> None:
     """TLS pre-shared keys need Python 3.13's ssl module (Anki 25 and the phone have it)."""
     if not getattr(ssl, "HAS_PSK", False):
         raise StoreError("Syncing over the network needs Python 3.13 or later (TLS pre-shared keys).")
+
+
+def _psk_context(*, server: bool) -> ssl.SSLContext:
+    """A TLS 1.2 context for the pre-shared-key cipher, without certificates; the caller adds the PSK callback.
+
+    Anki calls ``truststore.inject_into_ssl()``, which replaces ``ssl.SSLContext`` with a subclass that forwards
+    ciphers and versions to an inner context but not the PSK callbacks, so every handshake would fail with "no
+    ciphers available". A PSK channel needs no certificate store, so this builds the standard class. While it is
+    replaced, the standard class's own property setters recurse (they look up the replaced name), so the protocol
+    fields are set through the C base class's descriptors, as truststore does.
+    """
+    standard = next((cls for cls in ssl.SSLContext.__mro__
+                     if cls.__module__ == "ssl" and cls.__name__ == "SSLContext"), ssl.SSLContext)
+    base = _ssl._SSLContext
+    context = standard(ssl.PROTOCOL_TLS_SERVER if server else ssl.PROTOCOL_TLS_CLIENT)
+    if not server:
+        context.check_hostname = False  # there is no certificate: the key proves who the other side is
+        base.verify_mode.__set__(context, ssl.CERT_NONE)
+    base.minimum_version.__set__(context, ssl.TLSVersion.TLSv1_2)
+    base.maximum_version.__set__(context, ssl.TLSVersion.TLSv1_2)
+    context.set_ciphers(CIPHERS)
+    return context
 
 
 def new_key() -> bytes:
@@ -256,11 +281,7 @@ def find_pairing_hubs(*, port: int = DISCOVERY_PORT, targets: tuple[str, ...] = 
 
 
 def _pair_once(pin: str, name: str, host: str, port: int, timeout: float) -> Pairing:
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_2
-    context.set_ciphers(CIPHERS)
+    context = _psk_context(server=False)
     context.set_psk_client_callback(lambda hint: (PAIRING_IDENTITY, PAIRING_KEY))  # type: ignore[attr-defined]
     connection = http.client.HTTPSConnection(host, port, context=context, timeout=timeout)
     try:
@@ -272,7 +293,7 @@ def _pair_once(pin: str, name: str, host: str, port: int, timeout: float) -> Pai
             response = connection.getresponse()
             data = response.read(65536)
         except ssl.SSLError as error:
-            raise PairingRefused("The hub is not showing a code. Press Enter in the hub's window to show one.") from error
+            raise PairingRefused(_NOT_SHOWING) from error
         except (OSError, http.client.HTTPException) as error:
             raise PairingRefused(f"Could not reach the hub at {host}:{port} ({error}).") from error
         try:
@@ -282,7 +303,7 @@ def _pair_once(pin: str, name: str, host: str, port: int, timeout: float) -> Pai
         if response.status == 403:
             if reply.get("error") == "wrong code":
                 raise PairingRefused("That code is not right.")
-            raise PairingRefused("The hub is not showing a code. Press Enter in the hub's window to show one.")
+            raise PairingRefused(_NOT_SHOWING)
         if response.status != 200:
             raise PairingRefused(f"The hub refused to pair (HTTP {response.status}).")
         try:
@@ -471,7 +492,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
         self._reply(status, json.dumps({"error": message}).encode("utf-8"))
 
+    def _note(self, *, wrote: bool = False) -> None:
+        hub = getattr(self.server, "hub", None)
+        if hub is not None and self.identity and self.identity != PAIRING_IDENTITY:
+            hub.note(self.identity, wrote=wrote)
+
     def _target(self) -> tuple[str, str] | None:
+        self._note()
         parts = urlsplit(self.path)
         rel = parse_qs(parts.query, keep_blank_values=True).get("path", [""])[0]
         try:
@@ -611,6 +638,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             except OSError as error:
                 self._refuse(500, str(error))
                 return
+        self._note(wrote=True)
         self._reply(204)
 
     def do_DELETE(self) -> None:  # noqa: N802
@@ -633,12 +661,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except OSError as error:
             self._refuse(500, str(error))
             return
+        self._note(wrote=True)
         self._reply(204)
 
 
 class _Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # On Windows SO_REUSEADDR lets a second server take over a port that is in use; elsewhere it only skips TIME_WAIT.
+    allow_reuse_address = os.name != "nt"
     request_queue_size = 32
 
     def __init__(self, address: tuple[str, int], store: Store, context: ssl.SSLContext, *,
@@ -730,6 +760,20 @@ class Hub:
         self._stopping = threading.Event()
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
+        self._activity: dict[str, tuple[float, float | None]] = {}  # identity: (last request, last change)
+        self._activity_lock = threading.Lock()
+
+    def note(self, identity: str, *, wrote: bool = False) -> None:
+        """A paired device made a request (and, with ``wrote``, changed a file)."""
+        now = time.time()
+        with self._activity_lock:
+            _, changed = self._activity.get(identity, (0.0, None))
+            self._activity[identity] = (now, now if wrote else changed)
+
+    def activity(self) -> dict[str, tuple[float, float | None]]:
+        """For each device heard from since the hub started: (last request, last change or None)."""
+        with self._activity_lock:
+            return dict(self._activity)
 
     @property
     def port(self) -> int:
@@ -826,9 +870,7 @@ class Hub:
 
     def _context(self) -> ssl.SSLContext:
         require_psk()
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_2
-        context.set_ciphers(CIPHERS)
+        context = _psk_context(server=True)
         keys = self._keys
 
         def lookup(identity: str | None) -> bytes:
@@ -898,11 +940,7 @@ class HttpStore:
 
     def _context(self) -> ssl.SSLContext:
         require_psk()
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.check_hostname = False  # there is no certificate: the key proves who the hub is
-        context.verify_mode = ssl.CERT_NONE
-        context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_2
-        context.set_ciphers(CIPHERS)
+        context = _psk_context(server=False)
         identity, key = self._identity, self._key
         context.set_psk_client_callback(lambda hint: (identity, key))  # type: ignore[attr-defined]
         return context

@@ -1,11 +1,12 @@
 # Incremento Sync
 
 An Anki add-on that syncs [Incremento](https://github.com/BaskovicP/Incremento)'s own data between devices:
-priorities, the knowledge tree, reader bookmarks and positions, highlights, links between documents, local files, video
+priorities, reader bookmarks and positions, highlights, links between documents, local files, video
 files with their subtitles, and the PDF and EPUB documents themselves. (Audio topics are Anki media, which AnkiWeb syncs.) Anki's own sync (AnkiWeb) carries the cards; this carries what Incremento keeps beside them.
 
-It runs from a shared folder (Dropbox, Syncthing, a network drive…) or through a small hub on your own network, and it is
-what the Android app [Ankrimento](https://github.com/lukasheber/Ankrimento) uses to stay in step with desktop.
+Two ways to use it: **sync with your phone**, where Anki on your computer is the server for the Android app
+[Ankrimento](https://github.com/lukasheber/Ankrimento) on your own Wi-Fi (no cloud account), or **sync through a cloud folder**
+(Dropbox, Syncthing, a network drive…) to keep several computers in step.
 
 It is a separate add-on on purpose: Incremento is not changed, and anyone who does not need sync is not affected.
 
@@ -14,8 +15,12 @@ It is a separate add-on on purpose: Incremento is not changed, and anyone who do
 1. Install Incremento.
 2. Download `incremento_sync.ankiaddon` from the [releases](https://github.com/lukasheber/incremento-sync/releases) and open it
    in Anki (*Tools → Add-ons → Install from file…*). Restart Anki.
-3. Choose *Incremento → Sync Incremento Data…* and pick the shared folder (or pair with a hub, see
-   [docs/sync-hub.md](docs/sync-hub.md)). Do the same on every device.
+3. Choose *Incremento → Sync Incremento Data…*.
+   - **Set up phone sync** shows a six digit code; type it in Ankrimento (*Incremento settings → This device → Sync hub*).
+     Anki must be open while the phone syncs. See [docs/sync-hub.md](docs/sync-hub.md).
+   - **Choose folder…** picks a folder that a cloud service keeps in step on each computer. Do the same on every computer.
+
+   A profile syncs one way at a time; *Stop syncing* frees it to be set up another way.
 
 ## Switching it off puts everything back
 
