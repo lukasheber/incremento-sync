@@ -4,6 +4,14 @@ Used for the profile's local blob store and for the exchange folder's
 ``blobs/``. A blob is written to a temporary name while it is hashed and is
 renamed into place only when its bytes match its name, so a blob that exists
 under its name is complete and verified.
+
+On a phone (``LINK_PLACED_FILES``) a blob and the document it is placed as are
+one file (a hard link), not two copies: space is short there, and nothing
+writes a document in place (Incremento saves a changed PDF or EPUB to a new
+file and renames it over the old one, which leaves the blob as it was). The
+document path itself is never replaced to share it: the blob is made a link to
+the document, and only while the document is still the very file that was
+hashed (same inode, size and modification time).
 """
 
 from __future__ import annotations
@@ -13,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -24,6 +33,8 @@ except ImportError:
     from sync_store import Store, StoreError  # type: ignore[no-redef]
 
 MAX_BLOB_BYTES = 512 * 1024 * 1024
+#: Place received files as hard links to their blobs (Android): one file on disk instead of two.
+LINK_PLACED_FILES = hasattr(sys, "getandroidapilevel")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -141,9 +152,16 @@ def _place(temporary: Path, store: Path, sha: str) -> None:
 
 
 def store_file(store: Path, source: Path) -> str:
-    """Copy ``source`` into the store; returns its sha256."""
+    """Copy ``source`` into the store (on a phone: link it, when it can be); returns its sha256."""
     if Path(source).is_symlink():
         raise ValueError(f"{source} is a symlink")
+    if LINK_PLACED_FILES:
+        before = Path(source).stat()
+        if before.st_size > MAX_BLOB_BYTES:
+            raise ValueError(f"{Path(source).name} exceeds {MAX_BLOB_BYTES} bytes")
+        sha = _file_sha256(Path(source))
+        if share_with_blob(Path(store), sha, Path(source), before):
+            return sha
     temporary, sha = _copy_hashing(Path(source), Path(store) / ".tmp")
     _place(temporary, Path(store), sha)
     return sha
@@ -210,12 +228,48 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def share_with_blob(store: Path, sha: str, path: Path, hashed: os.stat_result) -> bool:
+    """Make ``path`` (whose content hashed to ``sha`` when it had the stat ``hashed``) the blob ``sha``: one file.
+
+    Only on a phone, and only while ``path`` is still that file; the document path is left alone. Returns whether the
+    blob and ``path`` are now one file; on any doubt or failure nothing changes.
+    """
+    if not LINK_PLACED_FILES or not _HEX64.match(sha):
+        return False
+    final = blob_path(store, sha)
+    linked = final.with_name(f".{sha}.link")
+    try:
+        if final.is_file() and os.path.samefile(final, path):
+            return True
+        final.parent.mkdir(parents=True, exist_ok=True)
+        linked.unlink(missing_ok=True)
+        os.link(path, linked)
+        now = linked.stat()
+        if (now.st_ino, now.st_size, now.st_mtime_ns) != (hashed.st_ino, hashed.st_size, hashed.st_mtime_ns):
+            return False  # the document changed after it was hashed: not this blob's content
+        os.replace(linked, final)
+        return True
+    except OSError:
+        return False  # e.g. another file system: the blob stays a copy
+    finally:
+        linked.unlink(missing_ok=True)
+
+
 def materialize(store: Path, sha: str, destination: Path) -> None:
-    """Atomically place a stored blob at ``destination``."""
+    """Atomically place a stored blob at ``destination`` (on a phone: the same file as the blob, when it can be)."""
     source = blob_path(store, sha)
     destination.parent.mkdir(parents=True, exist_ok=True)
     handle, name = tempfile.mkstemp(dir=destination.parent, prefix=f".{destination.name}.")
     os.close(handle)
+    if LINK_PLACED_FILES:
+        try:
+            Path(name).unlink()
+            os.link(source, name)
+            os.replace(name, destination)
+            return
+        except OSError:
+            Path(name).unlink(missing_ok=True)
+            Path(name).touch()  # another file system: a copy, as on a computer
     try:
         shutil.copyfile(source, name)
         with open(name, "r+b") as stream:  # Windows cannot fsync a read-only handle

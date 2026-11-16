@@ -29,13 +29,13 @@ from typing import Any
 try:
     from . import paths, sync_paths
     from .sync_anki import Query
-    from .sync_blobs import FileHashes, MAX_BLOB_BYTES, has_blob, materialize, store_file
+    from .sync_blobs import FileHashes, share_with_blob, MAX_BLOB_BYTES, has_blob, materialize, store_file
     from .sync_records import SyncScanError, card_key, split_card_key, value_hash
 except ImportError:
     import paths  # type: ignore[no-redef]
     import sync_paths  # type: ignore[no-redef]
     from sync_anki import Query  # type: ignore[no-redef]
-    from sync_blobs import FileHashes, MAX_BLOB_BYTES, has_blob, materialize, store_file  # type: ignore[no-redef]
+    from sync_blobs import FileHashes, share_with_blob, MAX_BLOB_BYTES, has_blob, materialize, store_file  # type: ignore[no-redef]
     from sync_records import SyncScanError, card_key, split_card_key, value_hash  # type: ignore[no-redef]
 
 NOTE_TYPE = "Incremento Video"
@@ -107,7 +107,10 @@ class VideoFileFamily:
 
     def _sha(self, path: Path) -> str:
         """sha256 of a file, remembered (across starts too) while its size and modification time are unchanged."""
-        return self._hashes.sha(path)
+        stat = path.stat()
+        sha = self._hashes.sha(path)
+        share_with_blob(self.blob_store, sha, path, stat)  # on a phone, one file with its blob
+        return sha
 
     def _notes(self, card_id: int | None = None) -> list[tuple[int, int, dict[str, str]]]:
         """(card id, note id, {slot: stored path}) of every video card in the collection that names a local video."""

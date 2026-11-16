@@ -32,12 +32,12 @@ from typing import Any
 
 try:
     from . import paths, sync_paths
-    from .sync_blobs import FileHashes, blob_path, has_blob, materialize, store_file
+    from .sync_blobs import FileHashes, share_with_blob, blob_path, has_blob, materialize, store_file
     from .sync_records import card_key, split_card_key, value_hash
 except ImportError:
     import paths  # type: ignore[no-redef]
     import sync_paths  # type: ignore[no-redef]
-    from sync_blobs import FileHashes, blob_path, has_blob, materialize, store_file  # type: ignore[no-redef]
+    from sync_blobs import FileHashes, share_with_blob, blob_path, has_blob, materialize, store_file  # type: ignore[no-redef]
     from sync_records import card_key, split_card_key, value_hash  # type: ignore[no-redef]
 
 KINDS = {"pdf": ("pdfs", ".pdf"), "epub": ("epubs", ".epub")}
@@ -91,7 +91,10 @@ class DocumentFamily:
 
     def _sha(self, path: Path) -> str:
         """sha256 of a file, remembered (across starts too) while its size and modification time are unchanged."""
-        return self._hashes.sha(path)
+        stat = path.stat()
+        sha = self._hashes.sha(path)
+        share_with_blob(self.blob_store, sha, path, stat)  # on a phone, one file with its blob
+        return sha
 
     def _interchange(self, conn: sqlite3.Connection, card_id: int, filename: str) -> dict[str, str] | None:
         row = conn.execute("SELECT filename, document_id, content_digest, baseline_json FROM pdf_annotation_sync "
