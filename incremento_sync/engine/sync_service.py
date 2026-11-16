@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import sync_paths
+    from . import paths as _paths, sync_paths
     from .db import get_connection as _host_connection
     from .sync_schema import ensure_schema
     from .sync_anki import Query, card_refs, collection_scm, collection_usn
@@ -32,15 +33,17 @@ try:
     from .sync_files import LocalFileFamily
     from .sync_videos import VideoFileFamily
     from .sync_links import LINK_FAMILIES
-    from .sync_blobs import Budget, blob_path
+    from .sync_blobs import Budget, blob_path, fetch_exchange_blob
     from .sync_exchange import (
-        EXCHANGE_DIR, announce, missing_blobs, publish, receive, release_waiting, sample_card_refs, unsent_blobs,
+        EXCHANGE_DIR, announce, library_rel, missing_blobs, publish, receive, release_waiting, sample_card_refs,
+        unsent_blobs,
     )
     from .sync_snapshot import catch_up, history_complete, retire_packs, sweep_blobs, write_snapshot_if_due
     from .sync_http import HttpStore, Pairing
     from .sync_store import LocalStore, Store, StoreError, as_store
     from .sync_records import FAMILIES, Family
 except ImportError:
+    import paths as _paths  # type: ignore[no-redef]
     import sync_paths  # type: ignore[no-redef]
     from db import get_connection as _host_connection  # type: ignore[no-redef]
     from sync_schema import ensure_schema  # type: ignore[no-redef]
@@ -53,9 +56,10 @@ except ImportError:
     from sync_files import LocalFileFamily  # type: ignore[no-redef]
     from sync_videos import VideoFileFamily  # type: ignore[no-redef]
     from sync_links import LINK_FAMILIES  # type: ignore[no-redef]
-    from sync_blobs import Budget, blob_path  # type: ignore[no-redef]
+    from sync_blobs import Budget, blob_path, fetch_exchange_blob  # type: ignore[no-redef]
     from sync_exchange import (  # type: ignore[no-redef]
-        EXCHANGE_DIR, announce, missing_blobs, publish, receive, release_waiting, sample_card_refs, unsent_blobs,
+        EXCHANGE_DIR, announce, library_rel, missing_blobs, publish, receive, release_waiting, sample_card_refs,
+        unsent_blobs,
     )
     from sync_snapshot import (  # type: ignore[no-redef]
         catch_up, history_complete, retire_packs, sweep_blobs, write_snapshot_if_due,
@@ -503,6 +507,59 @@ def _listener(on_progress: Callable[[SyncProgress], None] | None) -> Callable[[s
             pass
 
     return hear
+
+
+@dataclass(frozen=True)
+class FetchReport:
+    #: Files copied into this device's blob store by this call, and files still waiting after it.
+    fetched: int
+    left: int
+
+
+def fetch_files(addon_dir: str, profile: str, *, store: Store | None = None,
+                budget_seconds: float | None = None) -> FetchReport:
+    """Download files that received changes wait for into the blob store, without touching the Anki collection.
+
+    Only verified blobs are placed (named by their hash), and the profile's database is only read, through a
+    connection of its own: this can run while the app uses the collection, and the next ``sync_now`` places what
+    arrived. With ``budget_seconds`` it stops after at least one file once the time is up. Nothing to do (sync off,
+    nothing waiting, or a sync running) is ``FetchReport(0, 0)`` or the files left.
+    """
+    db_path = Path(_paths.get_db_path(addon_dir, profile))
+    if not db_path.is_file():
+        return FetchReport(0, 0)
+    reader = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=5)
+    try:
+        identity = sync_identity(reader)
+        label = _meta(reader, "folder")
+        blob_dir = sync_paths.get_sync_blob_dir(addon_dir, profile)
+        missing = sorted(missing_blobs(reader, blob_dir)) if identity is not None and label is not None else []
+    except sqlite3.Error:
+        return FetchReport(0, 0)  # sync tables not made yet: sync was never set up
+    finally:
+        reader.close()
+    if not missing:
+        return FetchReport(0, 0)
+    lock = _lock(addon_dir, profile)
+    if not lock.acquire(blocking=False):
+        return FetchReport(0, len(missing))  # a sync is moving files now
+    try:
+        owned = store is None
+        target = store if store is not None else store_for(addon_dir, profile, label)
+        budget, fetched = Budget(budget_seconds), 0
+        try:
+            library = library_rel(identity.library_id)
+            for sha in missing:
+                if fetched and budget.exceeded():
+                    break
+                if fetch_exchange_blob(target, library, sha, blob_dir):
+                    fetched += 1
+        finally:
+            if owned and hasattr(target, "close"):
+                target.close()
+        return FetchReport(fetched, len(missing) - fetched)
+    finally:
+        lock.release()
 
 
 def publish_now(addon_dir: str, profile: str, query: Query, *,

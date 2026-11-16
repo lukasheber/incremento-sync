@@ -142,3 +142,36 @@ def test_a_failing_progress_listener_does_not_stop_the_sync(tmp_path):
     report = sync_service.sync_now(a.addon, "P", CARDS, store=a.store, on_progress=broken)
 
     assert report.published >= DOCUMENTS
+
+
+# --- Files fetched apart from the sync, without the Anki collection --------------------------------------------------
+
+def test_waiting_files_can_be_fetched_without_the_collection_and_a_sync_then_places_them(tmp_path):
+    store = MemoryStore()
+    a, b = Device(tmp_path, "a", store), Device(tmp_path, "b", store)
+    a.add_documents(DOCUMENTS)
+    a.sync()
+    first, _ = b.sync(budget=0.0)  # learns of the documents, fetches one or two
+    assert first.more and first.files_to_receive > 0
+
+    rounds = []
+    while True:
+        fetched = sync_service.fetch_files(b.addon, "P", store=store, budget_seconds=0.0)
+        rounds.append(fetched)
+        if fetched.left == 0:
+            break
+        assert len(rounds) < 20
+
+    assert all(r.fetched >= 1 for r in rounds) and sum(r.fetched for r in rounds) == first.files_to_receive
+    assert sync_service.status(b.addon, "P").files_to_receive == 0  # here, though not yet placed
+    report, heard = b.sync()
+    assert not report.more and _stage(heard, "receiving") == []  # nothing left to download
+    assert len(list(paths.get_pdf_dir(b.addon, "P").glob("*.pdf"))) == DOCUMENTS
+
+
+def test_fetching_files_is_harmless_when_nothing_waits_or_sync_is_off(tmp_path):
+    store = MemoryStore()
+    a = Device(tmp_path, "a", store)
+
+    assert sync_service.fetch_files(a.addon, "P", store=store) == sync_service.FetchReport(0, 0)
+    assert sync_service.fetch_files(str(tmp_path / "never"), "P", store=store) == sync_service.FetchReport(0, 0)
