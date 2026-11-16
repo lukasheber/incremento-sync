@@ -26,13 +26,13 @@ from typing import Any
 try:
     from . import paths, sync_paths
     from .sync_anki import Query
-    from .sync_blobs import has_blob, materialize, store_file
+    from .sync_blobs import FileHashes, has_blob, materialize, store_file
     from .sync_records import SyncScanError, card_key, split_card_key, value_hash
 except ImportError:
     import paths  # type: ignore[no-redef]
     import sync_paths  # type: ignore[no-redef]
     from sync_anki import Query  # type: ignore[no-redef]
-    from sync_blobs import has_blob, materialize, store_file  # type: ignore[no-redef]
+    from sync_blobs import FileHashes, has_blob, materialize, store_file  # type: ignore[no-redef]
     from sync_records import SyncScanError, card_key, split_card_key, value_hash  # type: ignore[no-redef]
 
 NOTE_TYPE = "Incremento Local File"
@@ -73,7 +73,8 @@ class LocalFileFamily:
         self.blob_store = sync_paths.get_sync_blob_dir(addon_dir, profile)
         #: The collection's ``col.db.all``; the service sets it before each run.
         self.query: Query | None = None
-        self._hashes: dict[str, tuple[int, int, str]] = {}
+        self._hashes = FileHashes(sync_paths.get_sync_dir(addon_dir, profile) / "file-hashes-localfile.json",
+                                  lambda path: _file_sha(path))
 
     # --- keys, paths and versions -------------------------------------------------
 
@@ -88,14 +89,8 @@ class LocalFileFamily:
         return None if name is None else paths.get_local_files_dir(self.addon_dir, self.profile) / name
 
     def _sha(self, path: Path) -> str:
-        """sha256 of a file, remembered while its size and modification time are unchanged."""
-        stat = path.stat()
-        cached = self._hashes.get(str(path))
-        if cached and cached[:2] == (stat.st_size, stat.st_mtime_ns):
-            return cached[2]
-        sha = _file_sha(path)
-        self._hashes[str(path)] = (stat.st_size, stat.st_mtime_ns, sha)
-        return sha
+        """sha256 of a file, remembered (across starts too) while its size and modification time are unchanged."""
+        return self._hashes.sha(path)
 
     def _notes(self, card_id: int | None = None) -> list[tuple[int, int, str]]:
         """(card id, note id, stored path) of every managed-copy local file card in the collection."""
@@ -141,6 +136,7 @@ class LocalFileFamily:
             found = self._identity(note)
             if found is not None:
                 records.append((f"{card_key(note[0])}/localfile", found[0]))
+        self._hashes.save()
         return records
 
     def read(self, conn: sqlite3.Connection, key: str) -> dict[str, Any] | None:

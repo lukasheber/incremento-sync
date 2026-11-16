@@ -9,6 +9,7 @@ under its name is complete and verified.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -43,6 +44,57 @@ class Budget:
             self.more = True
             return True
         return False
+
+
+class FileHashes:
+    """sha256 of files, remembered while each file's size and modification time stay the same, kept on disk.
+
+    Scanning a library of many gigabytes would otherwise read every file again at the first sync after every start.
+    The record is only a shortcut: a missing or damaged one costs reading the files again, nothing else.
+    """
+
+    def __init__(self, path: Path, compute: Callable[[Path], str]):
+        self._path = Path(path)
+        self._compute = compute
+        self._known: dict[str, tuple[int, int, str]] | None = None
+        self._dirty = False
+
+    def _load(self) -> dict[str, tuple[int, int, str]]:
+        if self._known is None:
+            known: dict[str, tuple[int, int, str]] = {}
+            try:
+                for name, (size, mtime, sha) in json.loads(self._path.read_text(encoding="utf-8")).items():
+                    if isinstance(size, int) and isinstance(mtime, int) and isinstance(sha, str) and _HEX64.match(sha):
+                        known[name] = (size, mtime, sha)
+            except (OSError, ValueError, TypeError, AttributeError):
+                known = {}
+            self._known = known
+        return self._known
+
+    def sha(self, path: Path) -> str:
+        known = self._load()
+        stat = path.stat()
+        cached = known.get(str(path))
+        if cached and cached[:2] == (stat.st_size, stat.st_mtime_ns):
+            return cached[2]
+        sha = self._compute(path)
+        known[str(path)] = (stat.st_size, stat.st_mtime_ns, sha)
+        self._dirty = True
+        return sha
+
+    def save(self) -> None:
+        """Write what was learned (atomically); a failure only means reading the files again next time."""
+        if not self._dirty or self._known is None:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._path.with_name(self._path.name + ".tmp")
+            temporary.write_text(json.dumps({name: list(entry) for name, entry in self._known.items()}),
+                                 encoding="utf-8")
+            os.replace(temporary, self._path)
+            self._dirty = False
+        except OSError:
+            pass
 
 
 def blob_path(store: Path, sha: str) -> Path:

@@ -32,12 +32,12 @@ from typing import Any
 
 try:
     from . import paths, sync_paths
-    from .sync_blobs import blob_path, has_blob, materialize, store_file
+    from .sync_blobs import FileHashes, blob_path, has_blob, materialize, store_file
     from .sync_records import card_key, split_card_key, value_hash
 except ImportError:
     import paths  # type: ignore[no-redef]
     import sync_paths  # type: ignore[no-redef]
-    from sync_blobs import blob_path, has_blob, materialize, store_file  # type: ignore[no-redef]
+    from sync_blobs import FileHashes, blob_path, has_blob, materialize, store_file  # type: ignore[no-redef]
     from sync_records import card_key, split_card_key, value_hash  # type: ignore[no-redef]
 
 KINDS = {"pdf": ("pdfs", ".pdf"), "epub": ("epubs", ".epub")}
@@ -64,7 +64,8 @@ class DocumentFamily:
         self.addon_dir = addon_dir
         self.profile = profile
         self.blob_store = sync_paths.get_sync_blob_dir(addon_dir, profile)
-        self._hashes: dict[str, tuple[int, int, str]] = {}
+        self._hashes = FileHashes(sync_paths.get_sync_dir(addon_dir, profile) / "file-hashes-document.json",
+                                  lambda path: _file_sha(path))
 
     # --- keys, paths and versions -------------------------------------------------
 
@@ -89,14 +90,8 @@ class DocumentFamily:
         return self._directory(kind) / name
 
     def _sha(self, path: Path) -> str:
-        """sha256 of a file, remembered while its size and modification time are unchanged."""
-        stat = path.stat()
-        cached = self._hashes.get(str(path))
-        if cached and cached[:2] == (stat.st_size, stat.st_mtime_ns):
-            return cached[2]
-        sha = _file_sha(path)
-        self._hashes[str(path)] = (stat.st_size, stat.st_mtime_ns, sha)
-        return sha
+        """sha256 of a file, remembered (across starts too) while its size and modification time are unchanged."""
+        return self._hashes.sha(path)
 
     def _interchange(self, conn: sqlite3.Connection, card_id: int, filename: str) -> dict[str, str] | None:
         row = conn.execute("SELECT filename, document_id, content_digest, baseline_json FROM pdf_annotation_sync "
@@ -128,6 +123,7 @@ class DocumentFamily:
             found = self._identity(conn, row)
             if found is not None:
                 records.append((f"{card_key(row[2])}/document:{row[1]}", found[0]))
+        self._hashes.save()
         return records
 
     def read(self, conn: sqlite3.Connection, key: str) -> dict[str, Any] | None:
