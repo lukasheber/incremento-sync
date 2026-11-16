@@ -91,5 +91,8 @@
  "root_sync_failed": "Sinkronizacija Incrementa nije uspjela: {error}",
  "sync_remove_data": "Ukloni podatke sinkronizacije Incrementa…",
  "sync_remove_data_confirm": "Izbrisati podatke sinkronizacije na ovom uređaju (povijest, red i kopirane datoteke)? Kartice, dokumenti i postavke ostaju. Sljedeća sinkronizacija počinje ispočetka.",
- "sync_remove_data_done": "Podaci sinkronizacije uklonjeni."
+ "sync_remove_data_done": "Podaci sinkronizacije uklonjeni.",
+ "admin_sync_phone_fetching": "{name} se sinkronizirao {when}. Još {count} dokumenata s ovog računala putuje prema njemu.",
+ "admin_sync_phone_fetching_one": "{name} se sinkronizirao {when}. Još 1 dokument s ovog računala putuje prema njemu.",
+ "admin_sync_phone_placing": "{name} se sinkronizirao {when}. Neke promjene s ovog računala ondje još nisu primijenjene; slijede pri sljedećoj sinkronizaciji."
 }

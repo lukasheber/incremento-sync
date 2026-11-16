@@ -85,5 +85,7 @@
  "root_sync_failed": "Incremento 同步失败：{error}",
  "sync_remove_data": "移除 Incremento 同步数据…",
  "sync_remove_data_confirm": "删除此设备上的同步数据（历史、队列和复制的文件）？卡片、文档和设置不受影响。再次同步将从头开始。",
- "sync_remove_data_done": "同步数据已移除。"
+ "sync_remove_data_done": "同步数据已移除。",
+ "admin_sync_phone_fetching": "{name} 于{when}同步。此电脑还有 {count} 个文档正在传往该设备。",
+ "admin_sync_phone_placing": "{name} 于{when}同步。此电脑的部分更改尚未在该设备上生效，将在其下次同步时完成。"
 }

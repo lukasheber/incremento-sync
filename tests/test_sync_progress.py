@@ -175,3 +175,55 @@ def test_fetching_files_is_harmless_when_nothing_waits_or_sync_is_off(tmp_path):
 
     assert sync_service.fetch_files(a.addon, "P", store=store) == sync_service.FetchReport(0, 0)
     assert sync_service.fetch_files(str(tmp_path / "never"), "P", store=store) == sync_service.FetchReport(0, 0)
+
+
+# --- Whether another device has all of this one's changes ------------------------------------------------------------
+
+def test_another_device_is_behind_until_it_has_placed_this_ones_changes_and_their_files(tmp_path):
+    store = MemoryStore()
+    a, b = Device(tmp_path, "a", store), Device(tmp_path, "b", store)
+    a.add_documents(DOCUMENTS)
+    a.sync()
+    b_id = sync_service.sync_identity(db.get_connection(b.addon, "P")).device_id
+
+    b.sync(budget=0.0)  # b knows of everything, but most files are still to come
+    early = sync_service.peer_progress(a.addon, "P", store=store)[b_id]
+    while b.sync(budget=0.0)[0].more:
+        pass
+    done = sync_service.peer_progress(a.addon, "P", store=store)[b_id]
+
+    assert early.files_waiting > 0
+    assert done == sync_service.PeerProgress(behind=0, files_waiting=0)
+
+
+def test_a_device_that_does_not_say_what_it_has_is_left_out(tmp_path):
+    store = MemoryStore()
+    a, b = Device(tmp_path, "a", store), Device(tmp_path, "b", store)
+    a.sync()
+    b.sync()
+    b_id = sync_service.sync_identity(db.get_connection(b.addon, "P")).device_id
+    library = sync_service.sync_identity(db.get_connection(a.addon, "P")).library_id
+    rel = f"IncrementoSync/v1/{library}/devices/{b_id}/device.json"
+    import json
+    old = {key: value for key, value in json.loads(store.read(rel, 4096)).items() if key not in ("received", "files_waiting")}
+    store.write(rel, json.dumps(old).encode())  # as an older app version writes it
+
+    assert b_id not in sync_service.peer_progress(a.addon, "P", store=store)
+
+
+def test_what_a_device_announces_stays_small_enough_for_older_readers(tmp_path):
+    import json
+
+    import sync_exchange
+    store = MemoryStore()
+    a = Device(tmp_path, "a", store)
+    with db.get_connection(a.addon, "P") as conn:  # a library that has seen many devices come and go
+        conn.executemany("INSERT INTO sync_receipts(peer, epoch, max_seq) VALUES (?, 1, ?)",
+                         [(f"{index:032x}", index) for index in range(300)])
+    a.sync()
+    identity = sync_service.sync_identity(db.get_connection(a.addon, "P"))
+    data = store.read(f"IncrementoSync/v1/{identity.library_id}/devices/{identity.device_id}/device.json", 64 * 1024)
+
+    assert len(data) <= sync_exchange.MAX_DEVICE_FILE_BYTES
+    kept = json.loads(data)["received"]
+    assert kept and f"{299:032x}" in kept and f"{0:032x}" not in kept  # the ones it took most from stay

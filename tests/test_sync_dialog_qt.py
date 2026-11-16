@@ -480,3 +480,22 @@ def test_the_window_shows_a_progress_bar_while_files_move_and_follows_it_closely
         dialog.refresh()
         assert not shown(dialog._progress) and dialog._ticker.interval() == sync_dialog.STATUS_TICK_MS
     """)
+
+
+def test_a_phone_still_fetching_documents_is_not_said_to_have_all_changes():
+    _run(r"""
+        fetching = NS(name="pixel", seen=NOW - 60, changed=None, behind=0, files_waiting=120)
+        lines = sync_dialog.status_lines("phone", status(PHONE, last_sync=NOW - 30, published=NOW - 600),
+                                         phones=[fetching], now=NOW)
+        assert lines == [("busy", "pixel synced 1 min ago. 120 of this computer's documents are still on their way to it.")]
+        one = NS(name="pixel", seen=NOW - 60, changed=None, behind=0, files_waiting=1)
+        assert sync_dialog.status_lines("phone", status(PHONE, published=NOW - 600), phones=[one], now=NOW)[0][1] \
+            == "pixel synced 1 min ago. 1 of this computer's documents is still on its way to it."
+        placing = NS(name="pixel", seen=NOW - 60, changed=None, behind=4, files_waiting=0)
+        assert sync_dialog.status_lines("phone", status(PHONE, published=NOW - 600), phones=[placing], now=NOW) == [
+            ("info", "pixel synced 1 min ago. Some of this computer's changes are not in place there yet; "
+                     "they follow at its next sync.")]
+        complete = NS(name="pixel", seen=NOW - 60, changed=None, behind=0, files_waiting=0)
+        assert ("ok", "pixel synced 1 min ago and has all of this computer's changes.") in sync_dialog.status_lines(
+            "phone", status(PHONE, published=NOW - 600), phones=[complete], now=NOW)
+    """)

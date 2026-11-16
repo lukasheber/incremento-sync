@@ -390,7 +390,7 @@ def _maintain(conn: Any, folder: Store, usn: int, scm: int, now: Callable[[], fl
     write_snapshot_if_due(conn, folder, every=SNAPSHOT_EVERY_REVISIONS, max_age=SNAPSHOT_MAX_AGE_SECONDS,
                           now=timestamp, blob_store=blob_store, budget=budget)
     retire_packs(conn, folder)
-    announce(conn, folder, anki_usn=usn, anki_scm=scm)
+    announce(conn, folder, anki_usn=usn, anki_scm=scm, blob_store=blob_store)
     swept_at = float(_meta(conn, "swept_at") or 0)
     if timestamp - swept_at >= SWEEP_INTERVAL_SECONDS:
         sweep_blobs(folder, identity.library_id, now=timestamp, grace_seconds=BLOB_GRACE_SECONDS)
@@ -507,6 +507,54 @@ def _listener(on_progress: Callable[[SyncProgress], None] | None) -> Callable[[s
             pass
 
     return hear
+
+
+@dataclass(frozen=True)
+class PeerProgress:
+    #: Revisions of this device the other one has not placed yet, and files it still waits for.
+    behind: int
+    files_waiting: int
+
+
+def peer_progress(addon_dir: str, profile: str, *, store: Store | None = None) -> dict[str, PeerProgress]:
+    """How far each other device is with this one's changes, from what it announced (its device.json).
+
+    A device has all of this one's changes when it has placed every revision published so far (``behind`` 0) and no
+    file is still on its way to it (``files_waiting`` 0). Devices that do not announce it (older versions) are left
+    out, so the caller can fall back to when they last synced.
+    """
+    conn = get_connection(addon_dir, profile)
+    identity = sync_identity(conn)
+    label = _meta(conn, "folder")
+    if identity is None or label is None:
+        return {}
+    published = int(_meta(conn, "published_through") or 0)
+    owned = store is None
+    target = store if store is not None else store_for(addon_dir, profile, label)
+    devices = f"{library_rel(identity.library_id)}/devices"
+    progress: dict[str, PeerProgress] = {}
+    try:
+        for entry in target.listdir(devices):
+            if not entry.is_dir or entry.is_symlink or entry.name == identity.device_id:
+                continue
+            data = target.read(f"{devices}/{entry.name}/device.json", 64 * 1024)
+            try:
+                info = json.loads(data.decode("utf-8")) if data else None
+            except ValueError:
+                continue
+            if not isinstance(info, dict) or not isinstance(info.get("received"), dict):
+                continue
+            mine = info["received"].get(identity.device_id)
+            through = mine.get("through", 0) if isinstance(mine, dict) and mine.get("epoch") == identity.epoch else 0
+            waiting = info.get("files_waiting", 0)
+            progress[entry.name] = PeerProgress(max(0, published - int(through)),
+                                                int(waiting) if isinstance(waiting, int) else 0)
+    except (StoreError, OSError):
+        return {}
+    finally:
+        if owned and hasattr(target, "close"):
+            target.close()
+    return progress
 
 
 @dataclass(frozen=True)

@@ -173,3 +173,54 @@ def test_a_taken_port_falls_back_to_another_one(tmp_path):
 def test_the_address_is_shown_with_a_port_only_when_it_is_not_the_usual_one(server):
     server.start()
     assert server.address().endswith(f":{server.port}") or server.port == sync_http.DEFAULT_PORT
+
+
+def test_each_phone_says_whether_it_has_placed_this_computers_documents(server, tmp_path):
+    import paths
+    sync_phone.configure(server.addon, "P", query=CARDS)
+    server.start()
+    pairing = pair_with_pin(server.new_code(), "pixel", host="127.0.0.1", port=server.port)
+    for index in range(1, 4):
+        pdf = paths.get_pdf_dir(server.addon, "P") / f"book{index}.pdf"
+        pdf.parent.mkdir(parents=True, exist_ok=True)
+        pdf.write_bytes(b"%PDF-1.7\n" + f"book {index} ".encode() * 3000)
+        with db.get_connection(server.addon, "P") as conn:
+            conn.execute("INSERT INTO content_items(content_id, kind, card_id, note_id, storage_key, created_at, "
+                         "updated_at) VALUES (?, 'pdf', ?, ?, ?, 1, 1)",
+                         (f"{index:032x}", index, index * 10, f"pdfs/book{index}.pdf"))
+    sync_service.sync_now(server.addon, "P", CARDS)
+    phone_addon = str(tmp_path / "phone")
+    store = HttpStore.from_pairing(pairing)
+    try:
+        sync_service.configure(phone_addon, "P", "hub:pixel:test", query=CARDS, store=store)
+        sync_service.sync_now(phone_addon, "P", CARDS, store=store, budget_seconds=0.0)
+        partly = server.phones()[0]
+        while sync_service.sync_now(phone_addon, "P", CARDS, store=store, budget_seconds=0.0).more:
+            pass
+    finally:
+        store.close()
+    whole = server.phones()[0]
+
+    assert partly.files_waiting > 0  # its changes may already be in place (from a snapshot): the files are not
+    assert (whole.files_waiting, whole.behind) == (0, 0)
+
+
+def test_a_phone_announcing_what_it_has_placed_is_not_taken_for_a_change_it_sent(server, tmp_path):
+    sync_phone.configure(server.addon, "P", query=CARDS)
+    server.start()
+    pairing = pair_with_pin(server.new_code(), "pixel", host="127.0.0.1", port=server.port)
+    _set(server.addon, 3, 12.0)
+    sync_service.sync_now(server.addon, "P", CARDS)
+    store = HttpStore.from_pairing(pairing)
+    try:
+        sync_service.configure(str(tmp_path / "phone"), "P", "hub:pixel:test", query=CARDS, store=store)
+        sync_service.sync_now(str(tmp_path / "phone"), "P", CARDS, store=store)  # its first sync writes a snapshot
+        before = server.phones()[0].changed
+        _set(server.addon, 3, 13.0)
+        sync_service.sync_now(server.addon, "P", CARDS)
+        sync_service.sync_now(str(tmp_path / "phone"), "P", CARDS, store=store)  # only takes in, and says so
+    finally:
+        store.close()
+
+    assert server.phones()[0].changed == before
+    assert server.phones()[0].behind == 0

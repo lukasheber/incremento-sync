@@ -208,12 +208,17 @@ def publish(conn: sqlite3.Connection, root: Path | Store, *, anki_usn: int | Non
             break
     if progress is not None and handled:
         progress("sending", len(handled), len(to_send))
-    announce(conn, store, anki_usn=anki_usn, anki_scm=anki_scm)
+    announce(conn, store, anki_usn=anki_usn, anki_scm=anki_scm, blob_store=blob_store)
     return result
 
 
-def announce(conn: sqlite3.Connection, root: Path | Store, *, anki_usn: int | None, anki_scm: int | None) -> None:
-    """Write this device's device.json: its AnkiWeb state and what it has published and retired.
+def announce(conn: sqlite3.Connection, root: Path | Store, *, anki_usn: int | None, anki_scm: int | None,
+             blob_store: Path | None = None) -> None:
+    """Write this device's device.json: its AnkiWeb state, what it has published and retired, and what it has taken in.
+
+    ``received`` says, for each other device, through which of its revisions this one has placed everything, and
+    ``files_waiting`` (with ``blob_store``) how many files received changes still wait for: so another device can
+    tell whether this one has all of its changes, not only that it asked for them.
 
     Written after the packs, so a reader never sees a range announced before its packs exist here.
     """
@@ -224,11 +229,21 @@ def announce(conn: sqlite3.Connection, root: Path | Store, *, anki_usn: int | No
     row = conn.execute("SELECT value FROM sync_meta WHERE key='published_through'").fetchone()
     published = int(row[0]) if row else 0
     retired = conn.execute("SELECT value FROM sync_meta WHERE key='retired_through'").fetchone()
-    _write_json_if_changed(
-        store, f"{library_rel(identity.library_id)}/devices/{identity.device_id}/device.json",
-        {"format": SYNC_FORMAT, "device_id": identity.device_id, "epoch": identity.epoch, "anki_usn": anki_usn,
-         "anki_scm": anki_scm, "published": {"epoch": identity.epoch, "last_seq": int(published)},
-         "retired": {"epoch": identity.epoch, "through": int(retired[0]) if retired else 0}})
+    received: dict[str, dict[str, int]] = {}
+    for peer, epoch, through in conn.execute("SELECT peer, epoch, max_seq FROM sync_receipts ORDER BY peer, epoch"):
+        if peer != identity.device_id:
+            received[peer] = {"epoch": int(epoch), "through": int(through)}  # the newest epoch last
+    info: dict[str, Any] = {
+        "format": SYNC_FORMAT, "device_id": identity.device_id, "epoch": identity.epoch, "anki_usn": anki_usn,
+        "anki_scm": anki_scm, "published": {"epoch": identity.epoch, "last_seq": int(published)},
+        "retired": {"epoch": identity.epoch, "through": int(retired[0]) if retired else 0}, "received": received}
+    if blob_store is not None:
+        info["files_waiting"] = len(missing_blobs(conn, blob_store))
+    # Older readers refuse a device.json over MAX_DEVICE_FILE_BYTES: with many past devices, leave out the ones this
+    # device took least from (a device left out only reads as "not said" to that device).
+    while received and len(json.dumps(info)) > MAX_DEVICE_FILE_BYTES - 256:
+        del received[min(received, key=lambda peer: (received[peer]["through"], peer))]
+    _write_json_if_changed(store, f"{library_rel(identity.library_id)}/devices/{identity.device_id}/device.json", info)
 
 
 # --- Receiving -----------------------------------------------------------------

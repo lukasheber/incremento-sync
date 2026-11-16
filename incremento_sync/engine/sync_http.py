@@ -638,7 +638,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             except OSError as error:
                 self._refuse(500, str(error))
                 return
-        self._note(wrote=True)
+        # A device saying what it has (its device.json) is not a change it sent: packs and files are.
+        self._note(wrote=not rel.endswith("/device.json"))
         self._reply(204)
 
     def do_DELETE(self) -> None:  # noqa: N802

@@ -102,8 +102,16 @@ def status_lines(mode: str, status, *, phones=(), activity=None, now: float | No
     lines: list[tuple[str, str]] = []
     if mode == "phone":
         for phone in phones:
+            # What the phone says it has placed, when it says (an older app does not): a phone that asked after the
+            # newest changes may still be fetching their documents.
+            waiting, behind = getattr(phone, "files_waiting", None), getattr(phone, "behind", None)
             if phone.seen is None:
                 lines.append(("info", t("admin_sync_phone_never", name=phone.name)))
+            elif waiting:
+                lines.append(("busy", tn("admin_sync_phone_fetching", waiting, name=phone.name,
+                                         when=ago(phone.seen, now))))
+            elif behind:
+                lines.append(("info", t("admin_sync_phone_placing", name=phone.name, when=ago(phone.seen, now))))
             elif status.last_published and phone.seen < status.last_published:
                 lines.append(("info", t("admin_sync_phone_behind", name=phone.name, when=ago(phone.seen, now))))
             else:

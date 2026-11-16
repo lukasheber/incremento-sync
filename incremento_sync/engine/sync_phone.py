@@ -81,6 +81,7 @@ class PhoneServer:
     def __init__(self, addon_dir: str, profile: str, *, host: str = "0.0.0.0", port: int = DEFAULT_PORT,
                  discovery_port: int | None = DISCOVERY_PORT):
         sync_dir = sync_paths.get_sync_dir(addon_dir, profile)
+        self._addon_dir, self._profile = addon_dir, profile
         self.folder = hub_folder(addon_dir, profile)
         self.book = KeyBook(sync_dir / KEYS_NAME)
         self._owners = sync_dir / OWNERS_NAME
@@ -152,9 +153,30 @@ class PhoneServer:
         return host if self.port == DEFAULT_PORT else f"{host}:{self.port}"
 
     def phones(self) -> list[Phone]:
-        """The paired phones, with when each last synced and last sent a change (also from before a restart)."""
+        """The paired phones, with when each last synced and last sent a change (also from before a restart), and how
+        far each is with this computer's changes (None when the phone does not say)."""
         seen = self._activity()
-        return [Phone(name, *seen.get(name, (None, None))) for name in sorted(self.book.devices())]
+        progress = self._progress()
+        phones = []
+        for name in sorted(self.book.devices()):
+            mine = progress.get(name)
+            phones.append(Phone(name, *seen.get(name, (None, None)), behind=mine.behind if mine else None,
+                                files_waiting=mine.files_waiting if mine else None))
+        return phones
+
+    def _progress(self) -> dict[str, sync_service.PeerProgress]:
+        """Each phone's announced progress, by the name it was paired as (the hub knows which device folder is whose)."""
+        try:
+            owners = json.loads(self._owners.read_text(encoding="utf-8"))["owners"]
+            by_device = sync_service.peer_progress(self._addon_dir, self._profile, store=LocalStore(self.folder))
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+        progress: dict[str, sync_service.PeerProgress] = {}
+        for device, mine in by_device.items():
+            name = owners.get(device) if isinstance(owners, dict) else None
+            if isinstance(name, str):
+                progress[name] = mine  # a phone paired again has one folder per pairing: the last one listed wins
+        return progress
 
     def remove(self, name: str) -> bool:
         removed = self.book.revoke(name)
@@ -208,3 +230,6 @@ class Phone:
     #: When it last synced (any request), and when it last sent a change; None if never heard from.
     seen: float | None
     changed: float | None
+    #: This computer's revisions it has not placed yet, and files it still waits for; None when it does not say.
+    behind: int | None = None
+    files_waiting: int | None = None
