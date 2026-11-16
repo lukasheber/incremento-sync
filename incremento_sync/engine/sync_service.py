@@ -32,8 +32,10 @@ try:
     from .sync_files import LocalFileFamily
     from .sync_videos import VideoFileFamily
     from .sync_links import LINK_FAMILIES
-    from .sync_blobs import Budget
-    from .sync_exchange import EXCHANGE_DIR, announce, publish, receive, release_waiting, sample_card_refs
+    from .sync_blobs import Budget, blob_path
+    from .sync_exchange import (
+        EXCHANGE_DIR, announce, missing_blobs, publish, receive, release_waiting, sample_card_refs, unsent_blobs,
+    )
     from .sync_snapshot import catch_up, history_complete, retire_packs, sweep_blobs, write_snapshot_if_due
     from .sync_http import HttpStore, Pairing
     from .sync_store import LocalStore, Store, StoreError, as_store
@@ -51,9 +53,9 @@ except ImportError:
     from sync_files import LocalFileFamily  # type: ignore[no-redef]
     from sync_videos import VideoFileFamily  # type: ignore[no-redef]
     from sync_links import LINK_FAMILIES  # type: ignore[no-redef]
-    from sync_blobs import Budget  # type: ignore[no-redef]
+    from sync_blobs import Budget, blob_path  # type: ignore[no-redef]
     from sync_exchange import (  # type: ignore[no-redef]
-        EXCHANGE_DIR, announce, publish, receive, release_waiting, sample_card_refs,
+        EXCHANGE_DIR, announce, missing_blobs, publish, receive, release_waiting, sample_card_refs, unsent_blobs,
     )
     from sync_snapshot import (  # type: ignore[no-redef]
         catch_up, history_complete, retire_packs, sweep_blobs, write_snapshot_if_due,
@@ -101,6 +103,19 @@ class SyncReport:
     problems: list[str] = field(default_factory=list)
     #: File transfer was cut short by the time budget: call again to continue.
     more: bool = False
+    #: Files still to place in the sync location, their size, and files still to fetch from it, after this call.
+    files_to_send: int = 0
+    bytes_to_send: int = 0
+    files_to_receive: int = 0
+
+
+@dataclass(frozen=True)
+class SyncProgress:
+    """How far a sync is with files: ``stage`` is "preparing" (copying this device's files for sync), "sending" or
+    "receiving"; ``done`` of ``total`` files in this call."""
+    stage: str
+    done: int
+    total: int
 
 
 @dataclass(frozen=True)
@@ -116,6 +131,10 @@ class SyncStatus:
     stale_waiting: int = 0
     #: When this computer last put changes of its own in the sync location (None: never).
     last_published: int | None = None
+    #: Files waiting to be placed in the sync location, their size, and files waiting to be fetched from it.
+    files_to_send: int = 0
+    bytes_to_send: int = 0
+    files_to_receive: int = 0
 
 
 @dataclass(frozen=True)
@@ -282,7 +301,8 @@ def _lock(addon_dir: str, profile: str) -> threading.Lock:
 
 
 def _run(addon_dir: str, profile: str, folder: Store, query: Query, is_current: Callable[[], bool],
-         now: Callable[[], float], *, publish_only: bool = False, budget: Budget | None = None) -> SyncReport:
+         now: Callable[[], float], *, publish_only: bool = False, budget: Budget | None = None,
+         progress: Callable[[str, int, int], None] | None = None) -> SyncReport:
     conn = get_connection(addon_dir, profile)
     families = families_for(addon_dir, profile)
     # Local file cards exist only as Anki notes: this family reads them through the run's collection.
@@ -297,20 +317,23 @@ def _run(addon_dir: str, profile: str, folder: Store, query: Query, is_current: 
 
     report = SyncReport()
     steps: list[Callable[[], None]] = [
-        lambda: setattr(report, "captured", report.captured + capture(conn, families, resolver, now=now, collection_state=state).captured),
+        lambda: setattr(report, "captured", report.captured + capture(conn, families, resolver, now=now, collection_state=state,
+                                                                    progress=progress).captured),
         lambda: setattr(report, "published", report.published + publish(
-            conn, folder, anki_usn=usn, anki_scm=scm, blob_store=store, now=now, budget=budget).revisions_published),
+            conn, folder, anki_usn=usn, anki_scm=scm, blob_store=store, now=now, budget=budget, progress=progress).revisions_published),
         lambda: _catch_up(conn, folder, families, now),
-        lambda: _receive(report, receive(conn, folder, families, blob_store=store, now=now, budget=budget)),
+        lambda: _receive(report, receive(conn, folder, families, blob_store=store, now=now, budget=budget,
+                                                progress=progress)),
         lambda: _apply(report, apply(conn, families, resolver, collection_usn=usn, collection_scm=scm, blob_store=store,
                                     now=now)),
         # Parents that lived only in retired packs can no longer arrive: judge their children now.
         lambda: _release_retired(report, conn, folder, store, lambda: apply(
             conn, families, resolver, collection_usn=usn, collection_scm=scm, blob_store=store, now=now), now),
         # Local edits protected during apply are published in the same run.
-        lambda: setattr(report, "captured", report.captured + capture(conn, families, resolver, now=now, collection_state=state).captured),
+        lambda: setattr(report, "captured", report.captured + capture(conn, families, resolver, now=now, collection_state=state,
+                                                                    progress=progress).captured),
         lambda: setattr(report, "published", report.published + publish(
-            conn, folder, anki_usn=usn, anki_scm=scm, blob_store=store, now=now, budget=budget).revisions_published),
+            conn, folder, anki_usn=usn, anki_scm=scm, blob_store=store, now=now, budget=budget, progress=progress).revisions_published),
     ]
     steps.append(lambda: _maintain(conn, folder, usn, scm, now, store, budget))
     if publish_only:
@@ -322,9 +345,25 @@ def _run(addon_dir: str, profile: str, folder: Store, query: Query, is_current: 
         step()
     if budget is not None and budget.more:
         report.more = True
+    report.files_to_send, report.bytes_to_send, report.files_to_receive = _backlog(conn, store)
     if not publish_only and not report.more:
         _set_meta(conn, "last_sync", str(int(now())))
     return report
+
+
+def _backlog(conn: Any, blob_store: Path) -> tuple[int, int, int]:
+    """Files still to send, their size in bytes, and files still to receive."""
+    identity = sync_identity(conn)
+    if identity is None:
+        return 0, 0, 0
+    unsent = unsent_blobs(conn, identity.device_id)
+    size = 0
+    for sha in unsent:
+        try:
+            size += blob_path(blob_store, sha).stat().st_size
+        except (OSError, ValueError):
+            pass
+    return len(unsent), size, len(missing_blobs(conn, blob_store))
 
 
 def _catch_up(conn: Any, folder: Store, families: dict[str, Family], now: Callable[[], float]) -> None:
@@ -425,8 +464,13 @@ def _apply(report: SyncReport, result: Any) -> None:
 
 def sync_now(addon_dir: str, profile: str, query: Query, *, is_current: Callable[[], bool] = lambda: True,
              now: Callable[[], float] = time.time, publish_only: bool = False,
-             store: Store | None = None, budget_seconds: float | None = None) -> SyncReport:
-    """Capture, publish, receive and apply. Safe to call from a background worker."""
+             store: Store | None = None, budget_seconds: float | None = None,
+             on_progress: Callable[[SyncProgress], None] | None = None) -> SyncReport:
+    """Capture, publish, receive and apply. Safe to call from a background worker.
+
+    ``on_progress`` hears a ``SyncProgress`` as files are prepared, sent and received, on the worker's thread; a
+    listener that fails is ignored, so a closed window cannot stop a sync.
+    """
     conn = get_connection(addon_dir, profile)
     folder = _meta(conn, "folder") if sync_identity(conn) is not None else None
     if folder is None:
@@ -440,12 +484,25 @@ def sync_now(addon_dir: str, profile: str, query: Query, *, is_current: Callable
         target = store if store is not None else store_for(addon_dir, profile, folder)
         try:
             return _run(addon_dir, profile, target, query, is_current, now, publish_only=publish_only,
-                        budget=Budget(budget_seconds))
+                        budget=Budget(budget_seconds), progress=_listener(on_progress))
         finally:
             if owned and hasattr(target, "close"):
                 target.close()
     finally:
         lock.release()
+
+
+def _listener(on_progress: Callable[[SyncProgress], None] | None) -> Callable[[str, int, int], None] | None:
+    if on_progress is None:
+        return None
+
+    def hear(stage: str, done: int, total: int) -> None:
+        try:
+            on_progress(SyncProgress(stage, done, total))
+        except Exception:
+            pass
+
+    return hear
 
 
 def publish_now(addon_dir: str, profile: str, query: Query, *,
@@ -464,11 +521,13 @@ def status(addon_dir: str, profile: str, *, now: float | None = None) -> SyncSta
     last = _meta(conn, "last_sync")
     open_conflicts = conn.execute("SELECT count(*) FROM sync_conflicts WHERE resolved_revision IS NULL").fetchone()[0]
     published = conn.execute("SELECT max(published_at) FROM sync_outbox").fetchone()[0]
+    to_send, bytes_to_send, to_receive = _backlog(conn, sync_paths.get_sync_blob_dir(addon_dir, profile))
     return SyncStatus(configured=configured, folder=_meta(conn, "folder"),
                       last_sync=int(last) if last is not None else None, conflicts=open_conflicts,
                       waiting_for_anki=counts.get("pending_anki", 0), waiting_for_files=counts.get("pending_blob", 0),
                       waiting_for_parents=counts.get("pending_parent", 0), stale_waiting=stale,
-                      last_published=int(published) if published is not None else None)
+                      last_published=int(published) if published is not None else None,
+                      files_to_send=to_send, bytes_to_send=bytes_to_send, files_to_receive=to_receive)
 
 
 def discard_stale(addon_dir: str, profile: str, *, now: float | None = None) -> int:

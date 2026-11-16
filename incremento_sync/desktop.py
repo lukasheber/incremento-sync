@@ -35,6 +35,7 @@ _phone_seen: float | None = None
 _phone_sent_at = 0.0  # time.monotonic() of the last sync started for the phones
 _syncing = 0  # background syncs running
 _last_error: str | None = None  # why the last background sync failed, until one succeeds
+_progress = None  # sync_service.SyncProgress: how far the running sync is with files
 
 
 def _own_name() -> str:
@@ -175,8 +176,8 @@ class _Controller:
         return PhoneInfo(True, code[0] if code else None, code[1] if code else 0, server.address(), server.phones())
 
     def activity(self) -> Activity:
-        """Whether a sync is running now, and why the last one failed (None when it did not)."""
-        return Activity(_syncing > 0, _last_error)
+        """Whether a sync is running now and how far it is with files, and why the last one failed (None when it did not)."""
+        return Activity(_syncing > 0, _last_error, _progress if _syncing > 0 else None)
 
     def new_code(self) -> None:
         if _phone is not None and _phone_profile == self.profile:
@@ -213,6 +214,7 @@ class PhoneInfo:
 class Activity:
     syncing: bool
     error: str | None
+    progress: object = None  # sync_service.SyncProgress while files are prepared, sent or received
 
 
 def _phone_server(profile: str):
@@ -307,8 +309,10 @@ def start_background_sync(done=None) -> None:
         return generation == _generation and _profile() == profile
 
     def finish() -> None:
-        global _syncing
+        global _syncing, _progress
         _syncing = max(0, _syncing - 1)
+        if not _syncing:
+            _progress = None
         if done is not None:
             done()
 
@@ -323,7 +327,7 @@ def start_background_sync(done=None) -> None:
         return
 
     def run(col):
-        return _service().sync_now(_addon_dir, profile, col.db.all, is_current=is_current)
+        return _service().sync_now(_addon_dir, profile, col.db.all, is_current=is_current, on_progress=_heard)
 
     def succeeded(report) -> None:
         global _last_error
@@ -342,6 +346,12 @@ def start_background_sync(done=None) -> None:
         finish()
 
     QueryOp(parent=mw, op=run, success=succeeded).failure(failed).run_in_background()
+
+
+def _heard(progress) -> None:
+    """From the sync's worker thread: the window reads it on its next tick."""
+    global _progress
+    _progress = progress
 
 
 def _start_schedule() -> None:

@@ -7,7 +7,7 @@ and who is behind), is anything on its way, and is there anything to decide or w
 A thin view over a controller supplied by the composition root:
 ``status()``, ``conflicts()``, ``configure(folder)``, ``configure_hub(code)``, ``disable()``,
 ``sync(done)`` (runs in the background, calls ``done`` on the main thread), ``resolve(conflict_id, value)``,
-``discard_stale()``, ``activity()`` (``syncing``, ``error``) and, for phones, ``phone_unavailable()``,
+``discard_stale()``, ``activity()`` (``syncing``, ``error``, ``progress``) and, for phones, ``phone_unavailable()``,
 ``start_phone()``, ``phone()``, ``new_code()``, ``cancel_code()`` and ``remove_phone(name)``. The rules live in
 backend/sync_service.py and backend/sync_phone.py.
 """
@@ -19,14 +19,16 @@ import time
 from .i18n import t
 
 from aqt.qt import (
-    QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem, QPushButton, Qt,
-    QTimer, QVBoxLayout, QWidget,
+    QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem, QProgressBar,
+    QPushButton, Qt, QTimer, QVBoxLayout, QWidget,
 )
 from aqt.utils import askUser, showInfo
 
 MAX_VALUE_TEXT = 60
 CODE_TICK_MS = 1000
 STATUS_TICK_MS = 5000
+#: While files move, the window follows them this closely.
+PROGRESS_TICK_MS = 1000
 
 #: The mark shown before a status line, by kind, and its colour (None: the text colour).
 MARKS = {
@@ -46,6 +48,22 @@ def tn(message_id: str, count: int, **values) -> str:
         if one != message_id + "_one":
             return one
     return t(message_id, count=count, **values)
+
+
+def size_text(size: int) -> str:
+    """A file size the way a person reads it: "512 B", "1.5 MB", "3.0 GB"."""
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def progress_of(activity):
+    """How far the running sync is with files (a ``SyncProgress``), or None."""
+    progress = getattr(activity, "progress", None) if activity and activity.syncing else None
+    return progress if progress is not None and progress.total else None
 
 
 def mode_of(folder: str | None) -> str:
@@ -78,6 +96,9 @@ def status_lines(mode: str, status, *, phones=(), activity=None, now: float | No
     now = time.time() if now is None else now
     syncing = bool(activity and activity.syncing)
     error = activity.error if activity else None
+    progress = progress_of(activity)
+    running = (("busy", t(f"admin_sync_progress_{progress.stage}", done=progress.done, total=progress.total))
+               if progress else ("busy", t("admin_sync_exchanging")))
     lines: list[tuple[str, str]] = []
     if mode == "phone":
         for phone in phones:
@@ -89,16 +110,22 @@ def status_lines(mode: str, status, *, phones=(), activity=None, now: float | No
                 lines.append(("ok", t("admin_sync_phone_current", name=phone.name, when=ago(phone.seen, now))))
         newest = max((phone.changed for phone in phones if phone.changed), default=None)
         if syncing:
-            lines.append(("busy", t("admin_sync_exchanging")))
+            lines.append(running)
         elif newest and (not status.last_sync or newest > status.last_sync):
             lines.append(("busy", t("admin_sync_phone_incoming")))
     else:
         if syncing:
-            lines.append(("busy", t("admin_sync_exchanging")))
+            lines.append(running)
         elif status.last_sync:
             lines.append(("ok", t("admin_sync_last_synced", when=ago(status.last_sync, now))))
         else:
             lines.append(("info", t("admin_sync_never_synced")))
+    to_send, to_receive = getattr(status, "files_to_send", 0), getattr(status, "files_to_receive", 0)
+    if to_send and not progress:
+        lines.append(("wait", tn("admin_sync_files_to_send", to_send,
+                                 size=size_text(getattr(status, "bytes_to_send", 0)))))
+    if to_receive and not progress:
+        lines.append(("wait", tn("admin_sync_files_to_receive", to_receive)))
     if status.waiting_for_anki:
         lines.append(("wait", tn("admin_sync_waiting_for_anki", status.waiting_for_anki)))
     if status.waiting_for_files:
@@ -207,6 +234,7 @@ class SyncDialog(QDialog):
         self._pairing = False
         self._running = False
         self._stale = 0
+        self._activity = None
         self.setWindowTitle(t("admin_sync_title", profile=profile))
         self.setMinimumWidth(520)
         layout = QVBoxLayout(self)
@@ -310,6 +338,10 @@ class SyncDialog(QDialog):
         card.setFrameShape(QFrame.Shape.StyledPanel)
         card_layout = QVBoxLayout(card)
         card_layout.addWidget(self._status)
+        self._progress = QProgressBar()
+        self._progress.setAccessibleName(t("admin_sync_progress_name"))
+        self._progress.setHidden(True)
+        card_layout.addWidget(self._progress)
         self._discard = _link(t("admin_sync_discard"))
         self._discard.clicked.connect(self._discard_stale)
         card_layout.addLayout(_row(self._discard))
@@ -351,6 +383,7 @@ class SyncDialog(QDialog):
     # --- state -------------------------------------------------------------------
 
     def refresh(self) -> None:
+        self._activity = self._controller.activity()
         status = self._controller.status()
         self._configured = bool(status.configured)
         self._mode = mode_of(status.folder if status.configured else None)
@@ -368,7 +401,8 @@ class SyncDialog(QDialog):
             self._show_pairing(info)
         else:
             self._show_status(status, info)
-        self._ticker.setInterval(CODE_TICK_MS if self._pairing else STATUS_TICK_MS)
+        moving = self._mode != "none" and not self._pairing and progress_of(self._activity) is not None
+        self._ticker.setInterval(CODE_TICK_MS if self._pairing else PROGRESS_TICK_MS if moving else STATUS_TICK_MS)
         if self._mode == "none":
             self._ticker.stop()
         elif not self._ticker.isActive():
@@ -395,7 +429,12 @@ class SyncDialog(QDialog):
         self._mode_heading.setText(t(heading[self._mode]))
         self._where.setText(self._where_text(status))
         self._where.setVisible(self._mode in ("folder", "hub"))
-        activity = self._controller.activity()
+        activity = self._activity
+        progress = progress_of(activity)
+        self._progress.setVisible(progress is not None)
+        if progress is not None:
+            self._progress.setRange(0, progress.total)
+            self._progress.setValue(min(progress.done, progress.total))
         if self._mode == "phone" and not info.running:
             lines = [("error", t("admin_sync_phone_not_running"))]
             phones = []

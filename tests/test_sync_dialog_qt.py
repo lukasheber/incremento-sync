@@ -427,3 +427,56 @@ def test_the_discard_button_is_hidden_when_nothing_waited_too_long():
         dialog = sync_dialog.SyncDialog("Main", Controller(folder="C:/Cloud", waiting_for_anki=2))
         assert not shown(dialog._discard) and "waiting for their cards" in dialog._status.text()
     """)
+
+
+# --- A long sync shows how far it is ----------------------------------------------------------------------------
+
+def test_a_running_sync_says_which_files_it_is_at_instead_of_only_that_it_runs():
+    _run(r"""
+        progress = NS(stage="preparing", done=120, total=3400)
+        lines = sync_dialog.status_lines("phone", status(PHONE, last_sync=NOW - 600), phones=[phone(seen=NOW)],
+                                         activity=NS(syncing=True, error=None, progress=progress), now=NOW)
+        assert ("busy", "Preparing files for sync: 120 of 3400…") in lines
+        assert ("busy", "Sending and receiving changes…") not in lines
+        sending = sync_dialog.status_lines("folder", status("C:/Cloud"), now=NOW,
+                                           activity=NS(syncing=True, error=None, progress=NS(stage="sending", done=1, total=2)))
+        assert ("busy", "Sending files: 1 of 2…") in sending
+        receiving = sync_dialog.status_lines("folder", status("C:/Cloud"), now=NOW,
+                                             activity=NS(syncing=True, error=None, progress=NS(stage="receiving", done=0, total=9)))
+        assert ("busy", "Receiving files: 0 of 9…") in receiving
+    """)
+
+
+def test_files_left_for_a_later_sync_are_counted_with_their_size():
+    _run(r"""
+        left = SyncStatus(True, "C:/Cloud", NOW - 60, 0, 0, 0, 0, files_to_send=4, bytes_to_send=3 * 1024 ** 3,
+                          files_to_receive=1)
+        lines = sync_dialog.status_lines("folder", left, now=NOW)
+        assert ("wait", "4 files are still to be sent (3.0 GB).") in lines
+        assert ("wait", "1 file is still to be received.") in lines
+        assert sync_dialog.size_text(512) == "512 B" and sync_dialog.size_text(1536 * 1024) == "1.5 MB"
+    """)
+
+
+def test_the_window_shows_a_progress_bar_while_files_move_and_follows_it_closely():
+    _run(r"""
+        class Busy(Controller):
+            progress = None
+            def activity(self):
+                return NS(syncing=self.progress is not None, error=None, progress=self.progress)
+
+        controller = Busy(folder="C:/Cloud", last_sync=NOW)
+        dialog = sync_dialog.SyncDialog("Main", controller)
+        assert not shown(dialog._progress) and dialog._ticker.interval() == sync_dialog.STATUS_TICK_MS
+
+        controller.progress = NS(stage="sending", done=30, total=120)
+        dialog.refresh()
+        assert shown(dialog._progress)
+        assert (dialog._progress.value(), dialog._progress.maximum()) == (30, 120)
+        assert dialog._ticker.interval() == sync_dialog.PROGRESS_TICK_MS
+        assert "Sending files: 30 of 120" in dialog._status.text()
+
+        controller.progress = None
+        dialog.refresh()
+        assert not shown(dialog._progress) and dialog._ticker.interval() == sync_dialog.STATUS_TICK_MS
+    """)

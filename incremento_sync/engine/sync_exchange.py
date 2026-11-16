@@ -139,8 +139,11 @@ def _mark_published(conn: sqlite3.Connection, revision_ids: list[str], now: int)
 
 def publish(conn: sqlite3.Connection, root: Path | Store, *, anki_usn: int | None = None, anki_scm: int | None = None,
             blob_store: Path | None = None, now: Callable[[], float] = time.time,
-            budget: Budget | None = None) -> PublishResult:
+            budget: Budget | None = None,
+            progress: Callable[[str, int, int], None] | None = None) -> PublishResult:
     """Write every unpublished revision into packs below this device's folder.
+
+    ``progress`` hears ``("sending", done, total)`` before each file it places and once at the end.
 
     With a ``budget``, publishing stops before the next document once the time is up (always after at least one
     revision), so a large first upload happens over several calls; what was published is whole and in order.
@@ -169,6 +172,8 @@ def publish(conn: sqlite3.Connection, root: Path | Store, *, anki_usn: int | Non
         if not batches or batches[-1][0] != epoch or len(batches[-1][1]) >= MAX_PACK_REVISIONS:
             batches.append((epoch, []))
         batches[-1][1].append(row[:8])
+    to_send = {sha for row in rows for sha in json.loads(row[7]).get("blobs", [])}
+    handled: set[str] = set()
     stopped = False
     for epoch, whole in batches:
         # Files first: a pack never names a blob that has not been placed.
@@ -179,6 +184,9 @@ def publish(conn: sqlite3.Connection, root: Path | Store, *, anki_usn: int | Non
                 stopped = True
                 break
             for sha in blobs:
+                if progress is not None and sha not in handled:
+                    progress("sending", len(handled), len(to_send))
+                    handled.add(sha)
                 if blob_store is None or not put_exchange_blob(store, library, blob_store, sha):
                     raise RuntimeError(f"blob {sha} of revision {row[0]} is not in the local blob store")
             batch.append(row)
@@ -198,6 +206,8 @@ def publish(conn: sqlite3.Connection, root: Path | Store, *, anki_usn: int | Non
         result.revisions_published += len(batch)
         if stopped:
             break
+    if progress is not None and handled:
+        progress("sending", len(handled), len(to_send))
     announce(conn, store, anki_usn=anki_usn, anki_scm=anki_scm)
     return result
 
@@ -356,6 +366,24 @@ def _store(conn: sqlite3.Connection, revisions: list[dict[str, Any]], *, device:
     return new
 
 
+def missing_blobs(conn: sqlite3.Connection, blob_store: Path | None) -> set[str]:
+    """Files that received revisions wait for and that are not here yet."""
+    missing: set[str] = set()
+    for (deps,) in conn.execute("SELECT r.deps FROM sync_inbox i JOIN sync_revisions r ON r.id = i.revision_id "
+                                "WHERE i.status IN ('pending_parent', 'pending_blob')"):
+        missing.update(sha for sha in json.loads(deps).get("blobs", []) if not has_blob(blob_store, sha))
+    return missing
+
+
+def unsent_blobs(conn: sqlite3.Connection, device_id: str) -> set[str]:
+    """Files of this device's revisions that are not published yet."""
+    unsent: set[str] = set()
+    for (deps,) in conn.execute("SELECT r.deps FROM sync_outbox o JOIN sync_revisions r ON r.id = o.revision_id "
+                                "WHERE o.published_at IS NULL AND r.device = ?", (device_id,)):
+        unsent.update(json.loads(deps).get("blobs", []))
+    return unsent
+
+
 def release_waiting(conn: sqlite3.Connection, now: int, *, blob_store: Path | None = None,
                     fetch: Callable[[str], bool] | None = None, parents_may_be_retired: bool = False) -> int:
     """Re-check waiting revisions: parents known and blobs present make them received.
@@ -462,11 +490,13 @@ def sample_card_refs(root: Path | Store, library_id: str, limit: int = 50) -> di
 
 def receive(conn: sqlite3.Connection, root: Path | Store, families: Mapping[str, Family], *,
             blob_store: Path | None = None, now: Callable[[], float] = time.time,
-            budget: Budget | None = None) -> ReceiveResult:
+            budget: Budget | None = None,
+            progress: Callable[[str, int, int], None] | None = None) -> ReceiveResult:
     """Validate and record other devices' packs. Applies nothing.
 
     With a ``budget``, files are fetched until the time is up (always at least one); the revisions that wait for the
-    rest stay waiting and are released by a later call.
+    rest stay waiting and are released by a later call. ``progress`` hears ``("receiving", done, total)`` before
+    each file fetched and once at the end.
     """
     store = as_store(root)
     identity = sync_identity(conn)
@@ -536,15 +566,20 @@ def receive(conn: sqlite3.Connection, root: Path | Store, families: Mapping[str,
                 result.rejected += 1
                 _remember(conn, device.name, entry.name, "rejected", timestamp)
     fetched = 0
+    to_fetch = len(missing_blobs(conn, blob_store)) if progress is not None and blob_store is not None else 0
 
     def fetch_within_budget(sha: str) -> bool:
         nonlocal fetched
         if budget is not None and fetched and budget.exceeded():
             return False
+        if progress is not None and to_fetch:
+            progress("receiving", fetched, max(to_fetch, fetched + 1))
         fetched += 1
         return fetch_exchange_blob(store, library, sha, blob_store)  # type: ignore[arg-type]
 
     fetch = None if blob_store is None else fetch_within_budget
     release_waiting(conn, timestamp, blob_store=blob_store, fetch=fetch)
+    if progress is not None and to_fetch and fetched:
+        progress("receiving", fetched, max(to_fetch, fetched))
     result.received = conn.execute("SELECT count(*) FROM sync_inbox").fetchone()[0] - received_before
     return result

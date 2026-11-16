@@ -148,3 +148,13 @@ def test_the_window_hears_whether_a_sync_runs_and_why_the_last_one_failed():
         desktop._syncing, desktop._last_error = 1, "disk full"
         assert controller.activity() == desktop.Activity(True, "disk full")
     """)
+
+
+def test_the_window_hears_how_far_a_running_sync_is():
+    _run(r"""
+        import sync_service
+        assert controller.activity().progress is None
+        desktop._syncing = 1
+        desktop._heard(sync_service.SyncProgress("preparing", 3, 10))
+        assert controller.activity() == desktop.Activity(True, None, sync_service.SyncProgress("preparing", 3, 10))
+    """)

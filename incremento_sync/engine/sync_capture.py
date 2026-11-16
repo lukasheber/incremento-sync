@@ -39,6 +39,8 @@ except ImportError:
 #: Resolves card ids to the cards present in the Anki collection; absent ids
 #: are left out of the result.
 CardResolver = Callable[[Iterable[int]], Mapping[int, CardRef]]
+#: Hears how far a file stage is: ``(stage, done, total)``, e.g. ``("preparing", 3, 1200)``.
+ProgressListener = Callable[[str, int, int], None]
 
 
 class SyncNotEnabledError(RuntimeError):
@@ -254,12 +256,17 @@ def _store_digests(conn: sqlite3.Connection, digests: Mapping[str, str]) -> None
 
 
 def capture(conn: sqlite3.Connection, families: Mapping[str, Family], resolve_cards: CardResolver, *,
-            now: Callable[[], float] = time.time, collection_state: str = "") -> CaptureResult:
+            now: Callable[[], float] = time.time, collection_state: str = "",
+            progress: ProgressListener | None = None) -> CaptureResult:
     """Record what changed since the last capture.
 
     ``collection_state`` identifies the Anki collection's state (it changes
     whenever the collection does). A family with records waiting for their
     cards is skipped while both its rows and this state are unchanged.
+
+    ``progress`` hears ``("preparing", done, total)`` before each record that
+    carries files (each is copied into the blob store) and once at the end:
+    the slow part of a first capture of a large library.
     """
     identity = sync_identity(conn)
     if identity is None:
@@ -289,9 +296,15 @@ def capture(conn: sqlite3.Connection, families: Mapping[str, Family], resolve_ca
     # 2. One transaction: re-read live values and record what really changed.
     timestamp = int(now())
     captured = skipped = 0
+    ordered = sorted(candidates, key=lambda item: (item[0].name, item[1]))
+    with_files = sum(1 for family, _ in ordered if getattr(family, "blobs", None) is not None)
+    prepared = 0
     _begin_immediate(conn)
     try:
-        for family, key in sorted(candidates, key=lambda item: (item[0].name, item[1])):
+        for family, key in ordered:
+            if progress is not None and with_files and getattr(family, "blobs", None) is not None:
+                progress("preparing", prepared, with_files)
+                prepared += 1
             base = conn.execute("SELECT revision_id, value_hash FROM sync_baseline WHERE family=? AND key=?",
                                 (family.name, key)).fetchone()
             card_id = family.card_id(key)
@@ -322,4 +335,6 @@ def capture(conn: sqlite3.Connection, families: Mapping[str, Family], resolve_ca
     except BaseException:
         conn.rollback()
         raise
+    if progress is not None and with_files:
+        progress("preparing", with_files, with_files)
     return CaptureResult(captured, skipped)
