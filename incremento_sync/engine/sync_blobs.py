@@ -34,7 +34,8 @@ except ImportError:
 
 MAX_BLOB_BYTES = 512 * 1024 * 1024
 #: Place received files as hard links to their blobs (Android): one file on disk instead of two.
-LINK_PLACED_FILES = hasattr(sys, "getandroidapilevel")
+LINK_PLACED_FILES = (sys.platform == "android" or hasattr(sys, "getandroidapilevel")
+                     or ("ANDROID_DATA" in os.environ and "ANDROID_ROOT" in os.environ))
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
