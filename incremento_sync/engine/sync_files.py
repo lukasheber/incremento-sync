@@ -26,13 +26,13 @@ from typing import Any
 try:
     from . import paths, sync_paths
     from .sync_anki import Query
-    from .sync_blobs import FileHashes, share_with_blob, has_blob, materialize, store_file
+    from .sync_blobs import FileHashes, has_blob, materialize, store_file
     from .sync_records import SyncScanError, card_key, split_card_key, value_hash
 except ImportError:
     import paths  # type: ignore[no-redef]
     import sync_paths  # type: ignore[no-redef]
     from sync_anki import Query  # type: ignore[no-redef]
-    from sync_blobs import FileHashes, share_with_blob, has_blob, materialize, store_file  # type: ignore[no-redef]
+    from sync_blobs import FileHashes, has_blob, materialize, store_file  # type: ignore[no-redef]
     from sync_records import SyncScanError, card_key, split_card_key, value_hash  # type: ignore[no-redef]
 
 NOTE_TYPE = "Incremento Local File"
@@ -90,10 +90,7 @@ class LocalFileFamily:
 
     def _sha(self, path: Path) -> str:
         """sha256 of a file, remembered (across starts too) while its size and modification time are unchanged."""
-        stat = path.stat()
-        sha = self._hashes.sha(path)
-        share_with_blob(self.blob_store, sha, path, stat)  # on a phone, one file with its blob
-        return sha
+        return self._hashes.sha(path)
 
     def _notes(self, card_id: int | None = None) -> list[tuple[int, int, str]]:
         """(card id, note id, stored path) of every managed-copy local file card in the collection."""
@@ -192,6 +189,11 @@ class LocalFileFamily:
             raise ValueError("local file target is a symlink")
         if not (target.is_file() and self._sha(target) == value["blob"]):
             materialize(self.blob_store, value["blob"], target)
+
+    def placed_files(self, key: str, value: dict[str, Any]) -> list[tuple[str, Path]]:
+        """The blobs ``value`` names and where each is placed on this device."""
+        target = self._file(value["path"])
+        return [(value["blob"], target)] if target is not None and value.get("blob") else []
 
     def delete(self, conn: sqlite3.Connection, key: str) -> None:
         """Forget the record. The file stays: sync never deletes a user's file."""

@@ -31,12 +31,16 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .sync_blobs import Budget, fetch_exchange_blob, has_blob, put_exchange_blob
+    from .sync_blobs import (
+        Budget, fetch_exchange_blob, has_blob, placed_index, put_exchange_blob, restore_from_placed,
+    )
     from .sync_capture import revision_id, sync_identity
     from .sync_store import Entry, Store, StoreError, as_store
     from .sync_records import SYNC_FORMAT, Family, canonical_json, record_blobs, validate_card_deps
 except ImportError:
-    from sync_blobs import Budget, fetch_exchange_blob, has_blob, put_exchange_blob  # type: ignore[no-redef]
+    from sync_blobs import (  # type: ignore[no-redef]
+        Budget, fetch_exchange_blob, has_blob, placed_index, put_exchange_blob, restore_from_placed,
+    )
     from sync_store import Entry, Store, StoreError, as_store  # type: ignore[no-redef]
     from sync_capture import revision_id, sync_identity  # type: ignore[no-redef]
     from sync_records import (  # type: ignore[no-redef]
@@ -584,9 +588,14 @@ def receive(conn: sqlite3.Connection, root: Path | Store, families: Mapping[str,
                 _remember(conn, device.name, entry.name, "rejected", timestamp)
     fetched = 0
     to_fetch = len(missing_blobs(conn, blob_store)) if progress is not None and blob_store is not None else 0
+    placed: dict[str, list[tuple[Path, int, int]]] | None = None
 
     def fetch_within_budget(sha: str) -> bool:
-        nonlocal fetched
+        nonlocal fetched, placed
+        if placed is None:
+            placed = placed_index(blob_store)  # type: ignore[arg-type]
+        if restore_from_placed(blob_store, sha, placed):  # type: ignore[arg-type]
+            return True  # this device already holds the file (its blob was removed to keep one copy)
         if budget is not None and fetched and budget.exceeded():
             return False
         if progress is not None and to_fetch:

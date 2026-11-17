@@ -1,9 +1,10 @@
-"""On a phone, a document received through sync is one file on disk, not two.
+"""On a phone, a synced document takes its space once, not twice.
 
 The engine keeps every file it moves in its blob store (named by its hash) and places a copy where the document lives,
-so a phone held each document twice: 2.7 GB of documents took 5.4 GB. Where space is short (Android), the placed file
-is a hard link to the blob instead. That is safe because nothing writes a document in place: Incremento saves a
-changed PDF or EPUB to a new file and renames it over the old one, which leaves the blob as it was.
+so a phone held each document twice: 2.7 GB of documents took 5.4 GB. Android does not let an app hard-link files, so
+on a phone (``KEEP_ONE_COPY``) a blob is removed once its document is in place with the same content, and made again
+from that document if it is ever needed. Blobs something still needs stay: changes waiting to be placed, this
+device's changes not yet sent, and the versions of an open conflict. A computer keeps every blob, as before.
 """
 import hashlib
 import os
@@ -51,12 +52,22 @@ class Device:
     def pdf(self, index):
         return paths.get_pdf_dir(self.addon, "P") / f"book{index}.pdf"
 
-    def blob(self, path):
-        sha = hashlib.sha256(path.read_bytes()).hexdigest()
-        return sync_blobs.blob_path(sync_service.sync_paths.get_sync_blob_dir(self.addon, "P"), sha)
+    def blob(self, data: bytes):
+        return sync_blobs.blob_path(sync_service.sync_paths.get_sync_blob_dir(self.addon, "P"),
+                                    hashlib.sha256(data).hexdigest())
 
-    def sync(self):
-        report = sync_service.sync_now(self.addon, "P", CARDS, store=self.store)
+    def blobs(self):
+        store = sync_service.sync_paths.get_sync_blob_dir(self.addon, "P")
+        return sorted(path.name for path in store.glob("??/*")) if store.is_dir() else []
+
+    def save(self, index, data):
+        """As Incremento saves a changed document: a new file renamed over the old one."""
+        replacement = self.pdf(index).with_name(f"book{index}.pdf.tmp")
+        replacement.write_bytes(data)
+        os.replace(replacement, self.pdf(index))
+
+    def sync(self, budget=None):
+        report = sync_service.sync_now(self.addon, "P", CARDS, store=self.store, budget_seconds=budget)
         assert report.problems == [] and report.skipped is None, (report.problems, report.skipped)
         return report
 
@@ -68,70 +79,122 @@ def _fresh():
     db.close_connection()
 
 
-@pytest.fixture
-def phone(monkeypatch):
-    monkeypatch.setattr(sync_blobs, "LINK_PLACED_FILES", True)
+def _phone(monkeypatch, on=True):
+    monkeypatch.setattr(sync_blobs, "KEEP_ONE_COPY", on)
 
 
-def _received(tmp_path, count=3):
+def _two(tmp_path, count=3):
     store = MemoryStore()
-    a, b = Device(tmp_path, "a", store), Device(tmp_path, "b", store)
-    a.add_documents(count)
-    a.sync()
-    b.sync()
-    return a, b
+    computer, phone = Device(tmp_path, "computer", store), Device(tmp_path, "phone", store)
+    computer.add_documents(count)
+    computer.sync()
+    return computer, phone
 
 
-def test_a_received_document_and_its_blob_are_one_file_on_a_phone(tmp_path, phone):
-    _, b = _received(tmp_path)
+def test_a_phone_keeps_one_copy_of_each_received_document(tmp_path, monkeypatch):
+    computer, phone = _two(tmp_path)
+    _phone(monkeypatch)
 
-    for index in (1, 2, 3):
-        assert os.path.samefile(b.pdf(index), b.blob(b.pdf(index)))
+    phone.sync()
 
-
-def test_on_a_computer_a_received_document_is_a_copy_of_its_blob(tmp_path, monkeypatch):
-    monkeypatch.setattr(sync_blobs, "LINK_PLACED_FILES", False)
-    _, b = _received(tmp_path, 1)
-
-    assert not os.path.samefile(b.pdf(1), b.blob(b.pdf(1)))
+    assert [phone.pdf(i).read_bytes() for i in (1, 2, 3)] == [computer.pdf(i).read_bytes() for i in (1, 2, 3)]
+    assert phone.blobs() == []
+    assert len(computer.blobs()) == 3  # a computer keeps them
 
 
-def test_a_document_changed_on_the_phone_leaves_its_blob_whole_and_its_new_version_travels(tmp_path, phone):
-    a, b = _received(tmp_path, 1)
-    blob = b.blob(b.pdf(1))
-    original = blob.read_bytes()
-    replacement = b.pdf(1).with_name("book1.pdf.tmp")  # as Incremento saves an annotated PDF
-    replacement.write_bytes(original + b"\n% highlighted")
-    os.replace(replacement, b.pdf(1))
+def test_files_still_waiting_to_be_placed_keep_their_blobs(tmp_path, monkeypatch):
+    computer, phone = _two(tmp_path, 4)
+    _phone(monkeypatch)
 
-    assert blob.read_bytes() == original and hashlib.sha256(original).hexdigest() == blob.name
-    assert b.sync().published >= 1
-    a.sync()
-    assert a.pdf(1).read_bytes().endswith(b"% highlighted")
+    report = phone.sync(budget=0.0)  # some files arrive, not all are placed yet
+    placed = [i for i in (1, 2, 3, 4) if phone.pdf(i).is_file()]
 
-
-def test_documents_received_before_are_made_one_file_with_their_blobs_at_the_next_sync(tmp_path, monkeypatch):
-    monkeypatch.setattr(sync_blobs, "LINK_PLACED_FILES", False)
-    a, b = _received(tmp_path, 2)  # an earlier version placed copies
-    before = {index: b.pdf(index).stat().st_mtime_ns for index in (1, 2)}
-    monkeypatch.setattr(sync_blobs, "LINK_PLACED_FILES", True)
-
-    report = b.sync()
-
-    assert report.captured == 0 and report.published == 0  # the documents did not change
-    for index in (1, 2):
-        assert os.path.samefile(b.pdf(index), b.blob(b.pdf(index)))
-        assert b.pdf(index).stat().st_mtime_ns == before[index]
+    assert report.more
+    for blob in phone.blobs():  # what is kept is what waits
+        assert not any(hashlib.sha256(phone.pdf(i).read_bytes()).hexdigest() == blob for i in placed)
+    while phone.sync(budget=0.0).more:
+        pass
+    assert phone.blobs() == [] and all(phone.pdf(i).is_file() for i in (1, 2, 3, 4))
 
 
-def test_a_document_that_differs_from_every_blob_stays_as_it_is(tmp_path, phone):
-    store = MemoryStore()
-    a = Device(tmp_path, "a", store)
-    a.add_documents(1)
-    a.sync()  # captured: the blob is a copy of the document
-    a.pdf(1).write_bytes(a.pdf(1).read_bytes() + b"\n% edited")
+def test_a_document_changed_on_the_phone_is_sent_and_then_kept_once(tmp_path, monkeypatch):
+    computer, phone = _two(tmp_path, 1)
+    _phone(monkeypatch)
+    phone.sync()
+    changed = phone.pdf(1).read_bytes() + b"\n% highlighted on the phone"
+    phone.save(1, changed)
 
-    a.sync()
+    report = phone.sync()
+    computer.sync()
 
-    assert os.path.samefile(a.pdf(1), a.blob(a.pdf(1)))  # its new version was captured, then shared
-    assert a.pdf(1).read_bytes().endswith(b"% edited")
+    assert report.published >= 1
+    assert computer.pdf(1).read_bytes() == changed
+    assert phone.blobs() == []  # sent, so its blob went too
+
+
+def test_a_change_not_yet_sent_keeps_its_blob(tmp_path, monkeypatch):
+    computer, phone = _two(tmp_path, 1)
+    _phone(monkeypatch)
+    phone.sync()
+    changed = phone.pdf(1).read_bytes() + b"\n% offline"
+    phone.save(1, changed)
+
+    monkeypatch.setattr(sync_service, "publish", lambda *args, **kwargs: sync_service.PublishResult())  # hub away
+    sync_service.sync_now(phone.addon, "P", CARDS, store=phone.store)
+
+    assert phone.blob(changed).name in phone.blobs()  # captured, waiting to be sent
+
+
+def test_a_new_version_from_the_computer_replaces_the_one_on_the_phone(tmp_path, monkeypatch):
+    computer, phone = _two(tmp_path, 1)
+    _phone(monkeypatch)
+    phone.sync()
+    newer = computer.pdf(1).read_bytes() + b"\n% annotated on the computer"
+    computer.save(1, newer)
+    computer.sync()
+
+    phone.sync()
+
+    assert phone.pdf(1).read_bytes() == newer and phone.blobs() == []
+
+
+def test_a_blob_needed_again_is_made_from_the_document_on_the_phone_not_downloaded(tmp_path, monkeypatch):
+    computer, phone = _two(tmp_path, 1)
+    _phone(monkeypatch)
+    phone.sync()
+    data = phone.pdf(1).read_bytes()
+    library = sync_service.sync_identity(db.get_connection(phone.addon, "P")).library_id
+    downloads = []
+    real = sync_blobs.fetch_exchange_blob
+    monkeypatch.setattr(sync_service, "fetch_exchange_blob",
+                        lambda *args, **kwargs: downloads.append(args[2]) or real(*args, **kwargs))
+    import sync_exchange
+    monkeypatch.setattr(sync_exchange, "fetch_exchange_blob",
+                        lambda *args, **kwargs: downloads.append(args[2]) or real(*args, **kwargs))
+
+    assert sync_blobs.restore_from_placed(sync_service.sync_paths.get_sync_blob_dir(phone.addon, "P"),
+                                          hashlib.sha256(data).hexdigest())
+    assert phone.blob(data).read_bytes() == data and downloads == []
+    assert library  # the library is untouched
+
+
+def test_on_a_computer_every_blob_is_kept(tmp_path, monkeypatch):
+    computer, phone = _two(tmp_path)
+    _phone(monkeypatch, on=False)
+
+    phone.sync()
+
+    assert len(phone.blobs()) == 3
+
+
+def test_copies_made_before_are_removed_at_the_next_sync_on_a_phone(tmp_path, monkeypatch):
+    computer, phone = _two(tmp_path, 2)
+    _phone(monkeypatch, on=False)
+    phone.sync()  # an earlier version kept both copies
+    assert len(phone.blobs()) == 2
+    _phone(monkeypatch)
+
+    report = phone.sync()
+
+    assert report.captured == 0 and report.published == 0 and phone.blobs() == []
+    assert all(phone.pdf(i).read_bytes() == computer.pdf(i).read_bytes() for i in (1, 2))

@@ -29,13 +29,13 @@ from typing import Any
 try:
     from . import paths, sync_paths
     from .sync_anki import Query
-    from .sync_blobs import FileHashes, share_with_blob, MAX_BLOB_BYTES, has_blob, materialize, store_file
+    from .sync_blobs import FileHashes, MAX_BLOB_BYTES, has_blob, materialize, store_file
     from .sync_records import SyncScanError, card_key, split_card_key, value_hash
 except ImportError:
     import paths  # type: ignore[no-redef]
     import sync_paths  # type: ignore[no-redef]
     from sync_anki import Query  # type: ignore[no-redef]
-    from sync_blobs import FileHashes, share_with_blob, MAX_BLOB_BYTES, has_blob, materialize, store_file  # type: ignore[no-redef]
+    from sync_blobs import FileHashes, MAX_BLOB_BYTES, has_blob, materialize, store_file  # type: ignore[no-redef]
     from sync_records import SyncScanError, card_key, split_card_key, value_hash  # type: ignore[no-redef]
 
 NOTE_TYPE = "Incremento Video"
@@ -107,10 +107,7 @@ class VideoFileFamily:
 
     def _sha(self, path: Path) -> str:
         """sha256 of a file, remembered (across starts too) while its size and modification time are unchanged."""
-        stat = path.stat()
-        sha = self._hashes.sha(path)
-        share_with_blob(self.blob_store, sha, path, stat)  # on a phone, one file with its blob
-        return sha
+        return self._hashes.sha(path)
 
     def _notes(self, card_id: int | None = None) -> list[tuple[int, int, dict[str, str]]]:
         """(card id, note id, {slot: stored path}) of every video card in the collection that names a local video."""
@@ -236,6 +233,15 @@ class VideoFileFamily:
                 raise ValueError("video file target is a symlink")
             if not (target.is_file() and self._sha(target) == entry["blob"]):
                 materialize(self.blob_store, entry["blob"], target)
+
+    def placed_files(self, key: str, value: dict[str, Any]) -> list[tuple[str, Path]]:
+        """The blobs ``value`` names and where each is placed on this device."""
+        placed = []
+        for entry in value.get("files", []):
+            target = self._file(entry["slot"], entry["path"])
+            if target is not None and entry.get("blob"):
+                placed.append((entry["blob"], target))
+        return placed
 
     def delete(self, conn: sqlite3.Connection, key: str) -> None:
         """Forget the record. The files stay: sync never deletes a user's file."""

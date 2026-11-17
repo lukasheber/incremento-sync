@@ -5,13 +5,10 @@ Used for the profile's local blob store and for the exchange folder's
 renamed into place only when its bytes match its name, so a blob that exists
 under its name is complete and verified.
 
-On a phone (``LINK_PLACED_FILES``) a blob and the document it is placed as are
-one file (a hard link), not two copies: space is short there, and nothing
-writes a document in place (Incremento saves a changed PDF or EPUB to a new
-file and renames it over the old one, which leaves the blob as it was). The
-document path itself is never replaced to share it: the blob is made a link to
-the document, and only while the document is still the very file that was
-hashed (same inode, size and modification time).
+On a phone (``KEEP_ONE_COPY``) space is short and an app may not hard-link
+files: a blob is removed once its document is in place with the same content
+(see ``sync_service``), and made again from that document when it is needed
+(``restore_from_placed``), so each document takes its space once.
 """
 
 from __future__ import annotations
@@ -33,9 +30,9 @@ except ImportError:
     from sync_store import Store, StoreError  # type: ignore[no-redef]
 
 MAX_BLOB_BYTES = 512 * 1024 * 1024
-#: Place received files as hard links to their blobs (Android): one file on disk instead of two.
-LINK_PLACED_FILES = (sys.platform == "android" or hasattr(sys, "getandroidapilevel")
-                     or ("ANDROID_DATA" in os.environ and "ANDROID_ROOT" in os.environ))
+#: Keep one copy of each placed document, not a blob beside it (Android, where space is short).
+KEEP_ONE_COPY = (sys.platform == "android" or hasattr(sys, "getandroidapilevel")
+                 or ("ANDROID_DATA" in os.environ and "ANDROID_ROOT" in os.environ))
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -153,16 +150,9 @@ def _place(temporary: Path, store: Path, sha: str) -> None:
 
 
 def store_file(store: Path, source: Path) -> str:
-    """Copy ``source`` into the store (on a phone: link it, when it can be); returns its sha256."""
+    """Copy ``source`` into the store; returns its sha256."""
     if Path(source).is_symlink():
         raise ValueError(f"{source} is a symlink")
-    if LINK_PLACED_FILES:
-        before = Path(source).stat()
-        if before.st_size > MAX_BLOB_BYTES:
-            raise ValueError(f"{Path(source).name} exceeds {MAX_BLOB_BYTES} bytes")
-        sha = _file_sha256(Path(source))
-        if share_with_blob(Path(store), sha, Path(source), before):
-            return sha
     temporary, sha = _copy_hashing(Path(source), Path(store) / ".tmp")
     _place(temporary, Path(store), sha)
     return sha
@@ -229,48 +219,48 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def share_with_blob(store: Path, sha: str, path: Path, hashed: os.stat_result) -> bool:
-    """Make ``path`` (whose content hashed to ``sha`` when it had the stat ``hashed``) the blob ``sha``: one file.
+def placed_index(store: Path) -> dict[str, list[tuple[Path, int, int]]]:
+    """The fingerprinted files beside ``store`` by content: sha256 -> [(path, size, modification time)]."""
+    index: dict[str, list[tuple[Path, int, int]]] = {}
+    for record in sorted(Path(store).parent.glob("file-hashes-*.json")):
+        try:
+            entries = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(entries, dict):
+            for name, entry in entries.items():
+                if isinstance(entry, list) and len(entry) == 3 and isinstance(entry[2], str):
+                    index.setdefault(entry[2], []).append((Path(name), entry[0], entry[1]))
+    return index
 
-    Only on a phone, and only while ``path`` is still that file; the document path is left alone. Returns whether the
-    blob and ``path`` are now one file; on any doubt or failure nothing changes.
+
+def restore_from_placed(store: Path, sha: str, index: dict[str, list[tuple[Path, int, int]]] | None = None) -> bool:
+    """Make blob ``sha`` again from a placed file with that content, if this device has one; True when it is there.
+
+    The files a scan fingerprinted are listed beside the store (``file-hashes-*.json``); one whose size and
+    modification time are still those it was fingerprinted with is copied in and verified like any blob. Saves
+    downloading a file this device already holds, after its blob was removed to keep one copy.
     """
-    if not LINK_PLACED_FILES or not _HEX64.match(sha):
-        return False
-    final = blob_path(store, sha)
-    linked = final.with_name(f".{sha}.link")
-    try:
-        if final.is_file() and os.path.samefile(final, path):
-            return True
-        final.parent.mkdir(parents=True, exist_ok=True)
-        linked.unlink(missing_ok=True)
-        os.link(path, linked)
-        now = linked.stat()
-        if (now.st_ino, now.st_size, now.st_mtime_ns) != (hashed.st_ino, hashed.st_size, hashed.st_mtime_ns):
-            return False  # the document changed after it was hashed: not this blob's content
-        os.replace(linked, final)
+    if has_blob(store, sha):
         return True
-    except OSError:
-        return False  # e.g. another file system: the blob stays a copy
-    finally:
-        linked.unlink(missing_ok=True)
+    for path, size, mtime in (index if index is not None else placed_index(store)).get(sha, []):
+        try:
+            stat = path.stat()
+            if (stat.st_size, stat.st_mtime_ns) != (size, mtime) or path.is_symlink():
+                continue
+            if store_file(Path(store), path) == sha:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 def materialize(store: Path, sha: str, destination: Path) -> None:
-    """Atomically place a stored blob at ``destination`` (on a phone: the same file as the blob, when it can be)."""
+    """Atomically place a stored blob at ``destination``."""
     source = blob_path(store, sha)
     destination.parent.mkdir(parents=True, exist_ok=True)
     handle, name = tempfile.mkstemp(dir=destination.parent, prefix=f".{destination.name}.")
     os.close(handle)
-    if LINK_PLACED_FILES:
-        try:
-            Path(name).unlink()
-            os.link(source, name)
-            os.replace(name, destination)
-            return
-        except OSError:
-            Path(name).unlink(missing_ok=True)
-            Path(name).touch()  # another file system: a copy, as on a computer
     try:
         shutil.copyfile(source, name)
         with open(name, "r+b") as stream:  # Windows cannot fsync a read-only handle

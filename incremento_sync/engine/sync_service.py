@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import tempfile
 import threading
@@ -33,10 +34,11 @@ try:
     from .sync_files import LocalFileFamily
     from .sync_videos import VideoFileFamily
     from .sync_links import LINK_FAMILIES
-    from .sync_blobs import Budget, blob_path, fetch_exchange_blob
+    from . import sync_blobs as _blobs
+    from .sync_blobs import Budget, blob_path, fetch_exchange_blob, placed_index, restore_from_placed
     from .sync_exchange import (
-        EXCHANGE_DIR, announce, library_rel, missing_blobs, publish, receive, release_waiting, sample_card_refs,
-        unsent_blobs,
+        EXCHANGE_DIR, PublishResult, announce, library_rel, missing_blobs, publish, receive, release_waiting,
+        sample_card_refs, unsent_blobs,
     )
     from .sync_snapshot import catch_up, history_complete, retire_packs, sweep_blobs, write_snapshot_if_due
     from .sync_http import HttpStore, Pairing
@@ -56,10 +58,13 @@ except ImportError:
     from sync_files import LocalFileFamily  # type: ignore[no-redef]
     from sync_videos import VideoFileFamily  # type: ignore[no-redef]
     from sync_links import LINK_FAMILIES  # type: ignore[no-redef]
-    from sync_blobs import Budget, blob_path, fetch_exchange_blob  # type: ignore[no-redef]
+    import sync_blobs as _blobs  # type: ignore[no-redef]
+    from sync_blobs import (  # type: ignore[no-redef]
+        Budget, blob_path, fetch_exchange_blob, placed_index, restore_from_placed,
+    )
     from sync_exchange import (  # type: ignore[no-redef]
-        EXCHANGE_DIR, announce, library_rel, missing_blobs, publish, receive, release_waiting, sample_card_refs,
-        unsent_blobs,
+        EXCHANGE_DIR, PublishResult, announce, library_rel, missing_blobs, publish, receive, release_waiting,
+        sample_card_refs, unsent_blobs,
     )
     from sync_snapshot import (  # type: ignore[no-redef]
         catch_up, history_complete, retire_packs, sweep_blobs, write_snapshot_if_due,
@@ -340,6 +345,8 @@ def _run(addon_dir: str, profile: str, folder: Store, query: Query, is_current: 
             conn, folder, anki_usn=usn, anki_scm=scm, blob_store=store, now=now, budget=budget, progress=progress).revisions_published),
     ]
     steps.append(lambda: _maintain(conn, folder, usn, scm, now, store, budget))
+    if _blobs.KEEP_ONE_COPY:
+        steps.append(lambda: _keep_one_copy(conn, families, store))
     if publish_only:
         steps = steps[:2]
     for step in steps:
@@ -368,6 +375,71 @@ def _backlog(conn: Any, blob_store: Path) -> tuple[int, int, int]:
         except (OSError, ValueError):
             pass
     return len(unsent), size, len(missing_blobs(conn, blob_store))
+
+
+_SETTLED = ("applied", "conflict", "rejected", "obsolete")
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _keep_one_copy(conn: Any, families: dict[str, Family], blob_store: Path) -> int:
+    """On a phone: remove the blobs nothing needs; returns the bytes freed.
+
+    Needed: blobs of changes still waiting to be placed, of this device's changes not yet sent, of both versions of an
+    open conflict, and of a current value whose file is not in place with that content (then the blob is its only
+    copy). Every other blob is a second copy of a placed document, or of a version no longer current. A removed blob
+    is made again from its document if it is needed (``restore_from_placed``).
+    """
+    if not Path(blob_store).is_dir():
+        return 0
+    needed: set[str] = set()
+    for (deps,) in conn.execute("SELECT r.deps FROM sync_outbox o JOIN sync_revisions r ON r.id = o.revision_id "
+                                "WHERE o.published_at IS NULL"):
+        needed.update(json.loads(deps).get("blobs", []))
+    for (deps,) in conn.execute(f"SELECT r.deps FROM sync_inbox i JOIN sync_revisions r ON r.id = i.revision_id "
+                                f"WHERE i.status NOT IN ({','.join('?' * len(_SETTLED))})", _SETTLED):
+        needed.update(json.loads(deps).get("blobs", []))
+    for (heads,) in conn.execute("SELECT heads FROM sync_conflicts WHERE resolved_revision IS NULL"):
+        for head in json.loads(heads):
+            row = conn.execute("SELECT deps FROM sync_revisions WHERE id=?", (head,)).fetchone()
+            if row is not None:
+                needed.update(json.loads(row[0]).get("blobs", []))
+    used: list[Any] = []
+    for family_name, key, value, deps in conn.execute(
+            "SELECT b.family, b.key, r.value, r.deps FROM sync_baseline b JOIN sync_revisions r "
+            "ON r.id = b.revision_id WHERE r.value IS NOT NULL").fetchall():
+        blobs = json.loads(deps).get("blobs", [])
+        if not blobs:
+            continue
+        family = families.get(family_name)
+        placed_files = getattr(family, "placed_files", None)
+        try:
+            placed = dict(placed_files(key, json.loads(value))) if placed_files is not None else {}
+        except (ValueError, KeyError, TypeError):
+            placed = {}
+        for sha in blobs:
+            path = placed.get(sha)
+            try:
+                in_place = (path is not None and path.is_file() and not path.is_symlink()
+                            and family._sha(path) == sha)
+            except (OSError, ValueError):
+                in_place = False
+            if not in_place:
+                needed.add(sha)  # the blob is the only copy of this version here
+            elif family not in used:
+                used.append(family)
+    for family in used:
+        family._hashes.save()
+    freed = 0
+    for blob in Path(blob_store).glob("??/*"):
+        if blob.name in needed or blob.is_symlink() or not blob.is_file() or not _HEX64.match(blob.name):
+            continue
+        try:
+            size = blob.stat().st_size
+            blob.unlink()
+            freed += size
+        except OSError:
+            continue
+    return freed
 
 
 def _catch_up(conn: Any, folder: Store, families: dict[str, Family], now: Callable[[], float]) -> None:
@@ -597,7 +669,11 @@ def fetch_files(addon_dir: str, profile: str, *, store: Store | None = None,
         budget, fetched = Budget(budget_seconds), 0
         try:
             library = library_rel(identity.library_id)
+            placed = placed_index(blob_dir)
             for sha in missing:
+                if restore_from_placed(blob_dir, sha, placed):
+                    fetched += 1  # already on this device, as a placed document
+                    continue
                 if fetched and budget.exceeded():
                     break
                 if fetch_exchange_blob(target, library, sha, blob_dir):
