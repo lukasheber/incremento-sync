@@ -126,7 +126,8 @@ def _pack_bytes(identity_library: str, device: str, epoch: int, rows: list[tuple
 def _mark_published(conn: sqlite3.Connection, revision_ids: list[str], now: int) -> None:
     """The pack holding these revisions is written and verified: they leave the outbox.
 
-    The highest published sequence is kept in sync_meta, for device.json and snapshots.
+    The highest published sequence is kept in sync_meta, for device.json and snapshots, and when it was published
+    (``published_at``), for saying whether another device synced after it.
     """
     marks = ",".join("?" * len(revision_ids))
     with conn:
@@ -135,6 +136,7 @@ def _mark_published(conn: sqlite3.Connection, revision_ids: list[str], now: int)
         conn.execute("INSERT INTO sync_meta(key, value) VALUES ('published_through', ?) "
                      "ON CONFLICT(key) DO UPDATE SET value=max(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER))",
                      (str(int(highest or 0)),))
+        conn.execute("INSERT OR REPLACE INTO sync_meta(key, value) VALUES ('published_at', ?)", (str(int(now)),))
 
 
 def publish(conn: sqlite3.Connection, root: Path | Store, *, anki_usn: int | None = None, anki_scm: int | None = None,

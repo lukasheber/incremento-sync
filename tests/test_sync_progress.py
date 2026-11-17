@@ -227,3 +227,14 @@ def test_what_a_device_announces_stays_small_enough_for_older_readers(tmp_path):
     assert len(data) <= sync_exchange.MAX_DEVICE_FILE_BYTES
     kept = json.loads(data)["received"]
     assert kept and f"{299:032x}" in kept and f"{0:032x}" not in kept  # the ones it took most from stay
+
+
+def test_the_status_knows_when_this_device_last_put_changes_in_the_sync_location(tmp_path):
+    a = Device(tmp_path, "a", MemoryStore())
+    assert sync_service.status(a.addon, "P").last_published is None
+    with db.get_connection(a.addon, "P") as conn:
+        conn.execute("INSERT INTO priorities(card_id, priority) VALUES (2, 9.0)")
+
+    sync_service.sync_now(a.addon, "P", CARDS, store=a.store, now=lambda: 1_800_000_000.0)
+
+    assert sync_service.status(a.addon, "P").last_published == 1_800_000_000

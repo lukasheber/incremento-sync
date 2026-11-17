@@ -625,7 +625,8 @@ def status(addon_dir: str, profile: str, *, now: float | None = None) -> SyncSta
     counts = dict(conn.execute("SELECT status, count(*) FROM sync_inbox GROUP BY status").fetchall())
     last = _meta(conn, "last_sync")
     open_conflicts = conn.execute("SELECT count(*) FROM sync_conflicts WHERE resolved_revision IS NULL").fetchone()[0]
-    published = conn.execute("SELECT max(published_at) FROM sync_outbox").fetchone()[0]
+    # Published revisions leave the outbox: the time of the last publication is kept apart.
+    published = _meta(conn, "published_at") or conn.execute("SELECT max(published_at) FROM sync_outbox").fetchone()[0]
     to_send, bytes_to_send, to_receive = _backlog(conn, sync_paths.get_sync_blob_dir(addon_dir, profile))
     return SyncStatus(configured=configured, folder=_meta(conn, "folder"),
                       last_sync=int(last) if last is not None else None, conflicts=open_conflicts,
