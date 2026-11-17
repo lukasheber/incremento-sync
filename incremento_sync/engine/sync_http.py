@@ -64,6 +64,12 @@ IDLE_SECONDS = 60.0
 _IDENTITY = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # Below a device folder only the device that first wrote there may write or delete.
 _DEVICE_FOLDER = re.compile(r"^[^/]+/v[0-9]+/[^/]+/devices/([^/]+)/")
+_NUMBERED = re.compile(r"-[0-9]+$")
+
+
+def _same_device_name(a: str, b: str) -> bool:
+    """Whether two pairing names are one device paired again: the hub numbers a name already taken ("pixel-2")."""
+    return _NUMBERED.sub("", a) == _NUMBERED.sub("", b)
 DEFAULT_MAX_CONNECTIONS = 64
 DISCOVERY_PORT = 8766
 _DISCOVERY_REQUEST = b"IHUB1 "
@@ -673,10 +679,12 @@ class _Server(http.server.ThreadingHTTPServer):
     request_queue_size = 32
 
     def __init__(self, address: tuple[str, int], store: Store, context: ssl.SSLContext, *,
-                 state_path: Path | None = None, max_connections: int = DEFAULT_MAX_CONNECTIONS):
+                 state_path: Path | None = None, max_connections: int = DEFAULT_MAX_CONNECTIONS,
+                 key_book: KeyBook | None = None):
         self.store = store
         self.context = context
         self._state_path = state_path
+        self._book = key_book
         self._owners_lock = threading.Lock()
         self._owners: dict[str, str] = self._load_owners()
         self._slots = threading.BoundedSemaphore(max_connections)
@@ -692,7 +700,12 @@ class _Server(http.server.ThreadingHTTPServer):
             return {}
 
     def may_write(self, identity: str | None, rel: str) -> bool:
-        """Device folders belong to the device that first wrote in them; everything else is shared."""
+        """Device folders belong to the device that first wrote in them; everything else is shared.
+
+        A phone paired again without being removed first gets a numbered name ("pixel-2") and writes in its own folder
+        under it: only the device whose id names the folder writes there, so the folder follows the new pairing, and
+        the old pairing, now unused, is removed. A device of another name is still refused.
+        """
         found = _DEVICE_FOLDER.match(rel)
         if found is None:
             return True
@@ -700,6 +713,11 @@ class _Server(http.server.ThreadingHTTPServer):
             return False
         with self._owners_lock:
             owner = self._owners.setdefault(found[1], identity)
+            if owner != identity and _same_device_name(owner, identity):
+                self._owners[found[1]] = identity
+                if self._book is not None and owner not in self._owners.values():
+                    self._book.revoke(owner)
+                owner = identity
             if owner == identity and self._state_path is not None:
                 self._save_owners()
             return owner == identity
@@ -827,6 +845,12 @@ class Hub:
             return 200, {"name": chosen, "key": key.hex(), "port": int(self._server.server_address[1]),
                          "proof": _hub_proof(pin, binding, chosen, key)}
 
+    def may_write(self, identity: str | None, rel: str) -> bool:
+        """Whether the device paired as ``identity`` may write ``rel`` (see ``_Server.may_write``)."""
+        if self._server is None:
+            raise RuntimeError("the hub is not running")
+        return self._server.may_write(identity, rel)
+
     @property
     def discovery_port(self) -> int | None:
         return None if self._discovery is None else int(self._discovery.getsockname()[1])
@@ -888,7 +912,7 @@ class Hub:
         if self._server is not None:
             return
         self._server = _Server((self._host, self._port), self._store, self._context(),
-                               state_path=self._state_path, max_connections=self._max_connections)
+                               state_path=self._state_path, max_connections=self._max_connections, key_book=self._book)
         self._server.hub = self  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, name="incremento-hub", daemon=True)
         self._thread.start()

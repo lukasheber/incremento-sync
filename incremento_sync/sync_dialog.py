@@ -423,12 +423,18 @@ class SyncDialog(QDialog):
             self._code.setText(info.code)
             self._code_note.setText(t("admin_sync_phone_code_left", minutes=info.seconds_left // 60,
                                       seconds=info.seconds_left % 60))
-            self._address.setText(t("admin_sync_phone_address_code", code=info.code.replace(" ", ""),
-                                    address=info.address))
+            address = t("admin_sync_phone_address_code", code=info.code.replace(" ", ""), address=info.address)
+            if getattr(info, "tailscale", ""):
+                address += "\n" + t("admin_sync_phone_tailscale_code", code=info.code.replace(" ", ""),
+                                     address=info.tailscale)
+            self._address.setText(address)
         else:
             self._code.setText("— — —")
             self._code_note.setText(t("admin_sync_phone_code_expired"))
-            self._address.setText(t("admin_sync_phone_address", address=info.address))
+            address = t("admin_sync_phone_address", address=info.address)
+            if getattr(info, "tailscale", ""):
+                address += "\n" + t("admin_sync_phone_tailscale", address=info.tailscale)
+            self._address.setText(address)
         self._new_code.setVisible(not info.code)
         self._cancel_code.setVisible(bool(info.phones))
 

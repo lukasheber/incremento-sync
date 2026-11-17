@@ -58,6 +58,26 @@ def own_address() -> str:
         probe.close()
 
 
+#: Tailscale's own address inside every tailnet: the route to it tells this computer's Tailscale address.
+TAILSCALE_PROBE = "100.100.100.100"
+
+
+def tailscale_address() -> str:
+    """This computer's Tailscale address (100.64.0.0/10) while Tailscale runs, else ""."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((TAILSCALE_PROBE, 53))  # no packet is sent; the system only picks the interface it would use
+        address = str(probe.getsockname()[0])
+    except OSError:
+        return ""
+    finally:
+        probe.close()
+    parts = address.split(".")
+    if len(parts) == 4 and parts[0] == "100" and parts[1].isdigit() and 64 <= int(parts[1]) <= 127:
+        return address
+    return ""
+
+
 def supported() -> str | None:
     """None when this Python can serve phones, else the reason it cannot."""
     try:
@@ -150,6 +170,13 @@ class PhoneServer:
     def address(self) -> str:
         """``192.168.1.20`` or ``192.168.1.20:8800``: what a phone types after the comma if it cannot find us."""
         host = own_address() or "<this computer>"
+        return host if self.port == DEFAULT_PORT else f"{host}:{self.port}"
+
+    def tailscale(self) -> str:
+        """``100.x.y.z`` (with the port when it is not the usual one): the address to type away from home, or ""."""
+        host = tailscale_address()
+        if not host:
+            return ""
         return host if self.port == DEFAULT_PORT else f"{host}:{self.port}"
 
     def phones(self) -> list[Phone]:

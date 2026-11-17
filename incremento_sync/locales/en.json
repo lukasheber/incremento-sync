@@ -94,5 +94,7 @@
  "sync_remove_data_done": "Sync data removed.",
  "admin_sync_phone_fetching": "{name} synced {when}. {count} of this computer's documents are still on their way to it.",
  "admin_sync_phone_fetching_one": "{name} synced {when}. 1 of this computer's documents is still on its way to it.",
- "admin_sync_phone_placing": "{name} synced {when}. Some of this computer's changes are not in place there yet; they follow at its next sync."
+ "admin_sync_phone_placing": "{name} synced {when}. Some of this computer's changes are not in place there yet; they follow at its next sync.",
+ "admin_sync_phone_tailscale_code": "Away from home, through Tailscale: {code},{address}",
+ "admin_sync_phone_tailscale": "Away from home, through Tailscale, its address is {address}."
 }

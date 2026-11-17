@@ -173,7 +173,8 @@ class _Controller:
         if server is None or not server.running:
             return PhoneInfo(False, None, 0, "", [])
         code = server.code()
-        return PhoneInfo(True, code[0] if code else None, code[1] if code else 0, server.address(), server.phones())
+        return PhoneInfo(True, code[0] if code else None, code[1] if code else 0, server.address(), server.phones(),
+                         server.tailscale())
 
     def activity(self) -> Activity:
         """Whether a sync is running now and how far it is with files, and why the last one failed (None when it did not)."""
@@ -208,6 +209,7 @@ class PhoneInfo:
     seconds_left: int
     address: str
     phones: list  # sync_phone.Phone: name, seen, changed
+    tailscale: str = ""  # this computer's Tailscale address while Tailscale runs
 
 
 @dataclass(frozen=True)

@@ -499,3 +499,18 @@ def test_a_phone_still_fetching_documents_is_not_said_to_have_all_changes():
         assert ("ok", "pixel synced 1 min ago and has all of this computer's changes.") in sync_dialog.status_lines(
             "phone", status(PHONE, published=NOW - 600), phones=[complete], now=NOW)
     """)
+
+
+def test_pairing_also_shows_the_tailscale_address_when_there_is_one():
+    _run(r"""
+        class WithTailscale(Controller):
+            def phone(self):
+                return NS(running=True, code=self.code, seconds_left=272, address="192.168.1.20",
+                          tailscale="100.78.202.115", phones=list(self.phones))
+
+        dialog = sync_dialog.SyncDialog("Main", WithTailscale(folder=PHONE, code="099 118"))
+        text = dialog._address.text()
+        assert "099118,192.168.1.20" in text and "Tailscale" in text and "099118,100.78.202.115" in text
+        plain = sync_dialog.SyncDialog("Main", Controller(folder=PHONE, code="099 118"))
+        assert "Tailscale" not in plain._address.text()
+    """)

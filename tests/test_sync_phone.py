@@ -224,3 +224,65 @@ def test_a_phone_announcing_what_it_has_placed_is_not_taken_for_a_change_it_sent
 
     assert server.phones()[0].changed == before
     assert server.phones()[0].behind == 0
+
+
+def _phone_syncs(addon, pairing, card=None, value=None):
+    store = HttpStore.from_pairing(pairing)
+    try:
+        sync_service.configure(addon, "P", f"hub:{pairing.identity}:test", query=CARDS, store=store)
+        if card is not None:
+            _set(addon, card, value)
+        report = sync_service.sync_now(addon, "P", CARDS, store=store)
+    finally:
+        store.close()
+    return report
+
+
+def test_a_phone_paired_again_without_being_removed_keeps_syncing_and_is_listed_once(server, tmp_path):
+    sync_phone.configure(server.addon, "P", query=CARDS)
+    server.start()
+    phone_addon = str(tmp_path / "phone")
+    first = pair_with_pin(server.new_code(), "pixel", host="127.0.0.1", port=server.port)
+    assert _phone_syncs(phone_addon, first, 4, 10.0).problems == []
+
+    again = pair_with_pin(server.new_code(), "pixel", host="127.0.0.1", port=server.port)  # same phone, new code
+    report = _phone_syncs(phone_addon, again, 4, 20.0)
+    sync_service.sync_now(server.addon, "P", CARDS)
+
+    assert again.identity == "pixel-2"
+    assert report.problems == [] and report.published >= 1
+    assert _get(server.addon, 4) == 20.0
+    assert [phone.name for phone in server.phones()] == ["pixel-2"]
+
+
+def test_another_device_still_cannot_write_in_a_phones_folder(server, tmp_path):
+    sync_phone.configure(server.addon, "P", query=CARDS)
+    server.start()
+    pixel = pair_with_pin(server.new_code(), "pixel", host="127.0.0.1", port=server.port)
+    _phone_syncs(str(tmp_path / "phone"), pixel, 4, 10.0)
+    phone_id = sync_service.sync_identity(db.get_connection(str(tmp_path / "phone"), "P")).device_id
+    library = sync_service.sync_identity(db.get_connection(server.addon, "P")).library_id
+    rel = f"IncrementoSync/v1/{library}/devices/{phone_id}/device.json"
+
+    assert server._hub.may_write("pixel", rel)
+    assert not server._hub.may_write("laptop", rel)
+    assert [phone.name for phone in server.phones()] == ["pixel"]
+
+
+def test_the_tailscale_address_is_found_when_tailscale_runs(monkeypatch):
+    class Probe:
+        def __init__(self, address):
+            self.address = address
+        def __call__(self, *args):
+            return self
+        def connect(self, target):
+            self.target = target
+        def getsockname(self):
+            return (self.address, 50000)
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sync_phone.socket, "socket", Probe("100.78.202.115"))
+    assert sync_phone.tailscale_address() == "100.78.202.115"
+    monkeypatch.setattr(sync_phone.socket, "socket", Probe("192.168.1.5"))  # no Tailscale: the usual route
+    assert sync_phone.tailscale_address() == ""
