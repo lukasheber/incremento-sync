@@ -101,8 +101,12 @@ def extended_windows_path(path: str) -> str:
 
 
 class LocalStore:
-    def __init__(self, root: Path | str):
+    """A folder. With ``share_files`` (the computer's own phone folder) a file put in or taken out is a hard link to
+    its source instead of a copy, where the file system allows it: for files never written in place, like blobs."""
+
+    def __init__(self, root: Path | str, *, share_files: bool = False):
         self.root = Path(root)
+        self.share_files = share_files
         self._base = Path(extended_windows_path(str(self.root))) if os.name == "nt" else self.root
 
     def _path(self, rel: str) -> Path:
@@ -177,14 +181,47 @@ class LocalStore:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _link_or_copy(self, source: Path, temporary: Path) -> None:
+        """Fill ``temporary`` with ``source``: one file with it when sharing (and the file system allows), else a copy."""
+        if self.share_files:
+            try:
+                temporary.unlink(missing_ok=True)
+                os.link(source, temporary)
+                return
+            except OSError:
+                temporary.touch()
+        shutil.copyfile(source, temporary)
+
     def upload(self, local: Path, rel: str) -> None:
         path = self._file_path(rel)
         temporary = self._temporary(path)
         try:
-            shutil.copyfile(local, temporary)
+            self._link_or_copy(Path(local), temporary)
             self._commit(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
+
+    def share(self, local: Path, rel: str) -> int:
+        """Make the copy at ``rel`` one file with ``local`` (same content, as named by its hash); the bytes freed."""
+        if not self.share_files:
+            return 0
+        try:
+            path = self._file_path(rel)
+            if not path.is_file() or path.is_symlink() or os.path.samefile(path, local):
+                return 0
+            size = path.stat().st_size
+            if size != Path(local).stat().st_size:
+                return 0
+            temporary = self._temporary(path)
+            try:
+                temporary.unlink()
+                os.link(local, temporary)
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return size
+        except (OSError, StoreError):
+            return 0
 
     def download(self, rel: str, local: Path, limit: int) -> None:
         path = self._path(rel)
@@ -193,7 +230,7 @@ class LocalStore:
         if path.stat().st_size > limit:
             raise StoreError(f"{rel} is larger than {limit} bytes")
         Path(local).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(path, local)
+        self._link_or_copy(path, Path(local))
 
     def delete(self, rel: str) -> None:
         path = self._file_path(rel)

@@ -172,6 +172,18 @@ def exchange_blob_present(store: Store, library_rel: str, local_store: Path, sha
     return existing is not None and not existing.is_dir and existing.size == blob_path(local_store, sha).stat().st_size
 
 
+def share_exchange_blobs(store: Store, library_rel: str, local_store: Path) -> int:
+    """Make every blob also in the exchange one file with its local copy, where ``store`` shares files; bytes freed."""
+    share = getattr(store, "share", None)
+    if share is None or not getattr(store, "share_files", False) or not Path(local_store).is_dir():
+        return 0
+    freed = 0
+    for blob in Path(local_store).glob("??/*"):
+        if _HEX64.match(blob.name) and blob.is_file() and not blob.is_symlink():
+            freed += share(blob, exchange_blob_rel(library_rel, blob.name))
+    return freed
+
+
 def put_exchange_blob(store: Store, library_rel: str, local_store: Path, sha: str) -> bool:
     """Place one of this device's verified local blobs in the exchange. False if it has no local copy."""
     if not has_blob(local_store, sha):

@@ -35,7 +35,9 @@ try:
     from .sync_videos import VideoFileFamily
     from .sync_links import LINK_FAMILIES
     from . import sync_blobs as _blobs
-    from .sync_blobs import Budget, blob_path, fetch_exchange_blob, placed_index, restore_from_placed
+    from .sync_blobs import (
+        Budget, blob_path, fetch_exchange_blob, placed_index, restore_from_placed, share_exchange_blobs,
+    )
     from .sync_exchange import (
         EXCHANGE_DIR, PublishResult, announce, library_rel, missing_blobs, publish, receive, release_waiting,
         sample_card_refs, unsent_blobs,
@@ -60,7 +62,7 @@ except ImportError:
     from sync_links import LINK_FAMILIES  # type: ignore[no-redef]
     import sync_blobs as _blobs  # type: ignore[no-redef]
     from sync_blobs import (  # type: ignore[no-redef]
-        Budget, blob_path, fetch_exchange_blob, placed_index, restore_from_placed,
+        Budget, blob_path, fetch_exchange_blob, placed_index, restore_from_placed, share_exchange_blobs,
     )
     from sync_exchange import (  # type: ignore[no-redef]
         EXCHANGE_DIR, PublishResult, announce, library_rel, missing_blobs, publish, receive, release_waiting,
@@ -463,6 +465,9 @@ def _maintain(conn: Any, folder: Store, usn: int, scm: int, now: Callable[[], fl
                           now=timestamp, blob_store=blob_store, budget=budget)
     retire_packs(conn, folder)
     announce(conn, folder, anki_usn=usn, anki_scm=scm, blob_store=blob_store)
+    if blob_store is not None and getattr(folder, "share_files", False) and _meta(conn, "exchange_shared") is None:
+        share_exchange_blobs(folder, library_rel(identity.library_id), blob_store)  # copies made before: once
+        _set_meta(conn, "exchange_shared", "1")
     swept_at = float(_meta(conn, "swept_at") or 0)
     if timestamp - swept_at >= SWEEP_INTERVAL_SECONDS:
         sweep_blobs(folder, identity.library_id, now=timestamp, grace_seconds=BLOB_GRACE_SECONDS)
@@ -484,7 +489,7 @@ def _hub_path(addon_dir: str, profile: str) -> Path:
 def store_for(addon_dir: str, profile: str, label: str) -> Store:
     """The store a profile was configured with: a hub paired earlier, this computer's own phone folder, or a folder."""
     if label.startswith("phone:"):
-        return LocalStore(Path(label[len("phone:"):]))
+        return LocalStore(Path(label[len("phone:"):]), share_files=True)  # this computer's own phone folder
     if not label.startswith("hub:"):
         return LocalStore(Path(label))
     try:

@@ -72,7 +72,7 @@ def configure(addon_dir: str, profile: str, *, query=None) -> sync_service.Setup
     folder = hub_folder(addon_dir, profile)
     folder.mkdir(parents=True, exist_ok=True)
     return sync_service.configure(addon_dir, profile, LABEL_PREFIX + str(folder), query=query,
-                                  store=LocalStore(folder))
+                                  store=LocalStore(folder, share_files=True))
 
 
 class PhoneServer:
