@@ -95,6 +95,6 @@
  "admin_sync_phone_fetching": "{name} se sinkronizirao {when}. Još {count} dokumenata s ovog računala putuje prema njemu.",
  "admin_sync_phone_fetching_one": "{name} se sinkronizirao {when}. Još 1 dokument s ovog računala putuje prema njemu.",
  "admin_sync_phone_placing": "{name} se sinkronizirao {when}. Neke promjene s ovog računala ondje još nisu primijenjene; slijede pri sljedećoj sinkronizaciji.",
- "admin_sync_phone_tailscale_code": "Izvan kuće, preko Tailscalea: {code},{address}",
- "admin_sync_phone_tailscale": "Izvan kuće, preko Tailscalea, njegova je adresa {address}."
+ "admin_sync_phone_tailscale_code": "Izvan kuće, uz Tailscale na ovom računalu i na telefonu: {code},{address}",
+ "admin_sync_phone_tailscale": "Izvan kuće, uz Tailscale na ovom računalu i na telefonu, njegova je adresa {address}."
 }
