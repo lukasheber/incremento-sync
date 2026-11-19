@@ -31,14 +31,15 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import paths, sync_paths
+    from . import paths, sync_blobs, sync_paths
     from .sync_blobs import FileHashes, blob_path, has_blob, materialize, store_file
-    from .sync_records import card_key, split_card_key, value_hash
+    from .sync_records import SyncScanError, card_key, split_card_key, value_hash
 except ImportError:
     import paths  # type: ignore[no-redef]
+    import sync_blobs  # type: ignore[no-redef]
     import sync_paths  # type: ignore[no-redef]
     from sync_blobs import FileHashes, blob_path, has_blob, materialize, store_file  # type: ignore[no-redef]
-    from sync_records import card_key, split_card_key, value_hash  # type: ignore[no-redef]
+    from sync_records import SyncScanError, card_key, split_card_key, value_hash  # type: ignore[no-redef]
 
 KINDS = {"pdf": ("pdfs", ".pdf"), "epub": ("epubs", ".epub")}
 IDENTITY_FIELDS = ("kind", "content_id", "note_id", "path", "version")
@@ -47,6 +48,9 @@ MAX_BASELINE_CHARS = 4 * 1024 * 1024
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _VERSION = re.compile(r"^(digest|sha256):[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: Incremento's note type and file field for each kind: how its reader finds a card's file.
+NOTE_TYPES = {"pdf": ("Incremento PDF", "PDF_Filename"), "epub": ("Incremento EPUB", "EPUB_Filename")}
+CONTENT_ID_FIELD = "Incremento_Content_ID"
 
 
 def _file_sha(path: Path) -> str:
@@ -66,6 +70,9 @@ class DocumentFamily:
         self.blob_store = sync_paths.get_sync_blob_dir(addon_dir, profile)
         self._hashes = FileHashes(sync_paths.get_sync_dir(addon_dir, profile) / "file-hashes-document.json",
                                   lambda path: _file_sha(path))
+        #: The collection's ``col.db.all``; the service sets it before each run. Without it only ``content_items``
+        #: is read.
+        self.query: Any = None
 
     # --- keys, paths and versions -------------------------------------------------
 
@@ -100,15 +107,81 @@ class DocumentFamily:
             return None
         return {"document_id": row[1], "content_digest": row[2], "baseline_json": row[3]}
 
-    def _rows(self, conn: sqlite3.Connection, where: str = "", args: tuple[Any, ...] = ()) -> list[tuple]:
-        return conn.execute("SELECT content_id, kind, card_id, note_id, storage_key FROM content_items "
-                            "WHERE kind IN ('pdf', 'epub') AND card_id IS NOT NULL" + where
-                            + " ORDER BY card_id, kind", args).fetchall()
+    def _notes(self, card_id: int | None = None) -> dict[tuple[str, int], tuple[int, str, str]]:
+        """(kind, card id) -> (note id, file name, content id) of every PDF and EPUB card in the collection.
+
+        The content id is the note's own (``Incremento_Content_ID``) or, without one, made from the note's GUID,
+        which is the same on every device.
+        """
+        if self.query is None:
+            return {}
+        found: dict[tuple[str, int], tuple[int, str, str]] = {}
+        try:
+            for kind, (type_name, file_field) in NOTE_TYPES.items():
+                types = self.query("SELECT id FROM notetypes WHERE name = ?", type_name)
+                if not types:
+                    continue
+                ntid = types[0][0]
+                ords = {name: ordinal for name, ordinal in self.query("SELECT name, ord FROM fields WHERE ntid = ?",
+                                                                      ntid)}
+                if file_field not in ords:
+                    continue
+                where, args = (" AND c.id = ?", (card_id,)) if card_id is not None else ("", ())
+                for cid, nid, guid, flds in self.query(
+                        "SELECT c.id, n.id, n.guid, n.flds FROM cards c JOIN notes n ON n.id = c.nid "
+                        "WHERE n.mid = ? AND c.ord = 0" + where, ntid, *args):
+                    fields = str(flds).split("\x1f")
+                    name = fields[ords[file_field]].strip() if len(fields) > ords[file_field] else ""
+                    if not name:
+                        continue
+                    own = ords.get(CONTENT_ID_FIELD)
+                    content_id = fields[own].strip() if own is not None and len(fields) > own else ""
+                    if not _SAFE_ID.match(content_id):
+                        content_id = hashlib.sha256(f"{kind}:{guid}".encode("utf-8")).hexdigest()[:32]
+                    found[(kind, int(cid))] = (int(nid), name, content_id)
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):  # a collection without note types has no documents
+                return {}
+            raise SyncScanError(f"the Anki collection could not be read: {exc}") from exc
+        return found
+
+    def _rows(self, conn: sqlite3.Connection, card_id: int | None = None, kind: str | None = None) -> list[tuple]:
+        """(content id, kind, card id, note id, storage key) of every document, as Incremento's reader finds them.
+
+        Incremento records documents in ``content_items`` only since its August 2026 update, and finds a card's
+        file through the note: a document with no row is taken from its note, and a row whose file is gone follows
+        the note when the note names a file that is there (a repaired file name).
+        """
+        where, args = ("", ())
+        if card_id is not None:
+            where, args = " AND card_id=? AND kind=?", (card_id, kind)
+        rows = conn.execute("SELECT content_id, kind, card_id, note_id, storage_key FROM content_items "
+                            "WHERE kind IN ('pdf', 'epub') AND card_id IS NOT NULL" + where, args).fetchall()
+        notes = self._notes(card_id)
+        documents = []
+        recorded = set()
+        for content_id, row_kind, row_card, note_id, storage_key in rows:
+            recorded.add((row_kind, row_card))
+            note = notes.get((row_kind, row_card))
+            if note is not None:
+                folder = KINDS[row_kind][0]
+                current = self._file(row_kind, storage_key or "")
+                named = self._file(row_kind, f"{folder}/{note[1]}")
+                if (current is None or not current.is_file()) and named is not None and named.is_file():
+                    storage_key = f"{folder}/{note[1]}"
+            documents.append((content_id, row_kind, row_card, note_id, storage_key))
+        for (note_kind, note_card), (note_id, name, content_id) in notes.items():
+            if (note_kind, note_card) in recorded or (kind is not None and note_kind != kind):
+                continue
+            documents.append((content_id, note_kind, note_card, note_id, f"{KINDS[note_kind][0]}/{name}"))
+        return sorted(documents, key=lambda row: (row[2], row[1]))
 
     def _identity(self, conn: sqlite3.Connection, row: tuple) -> tuple[dict[str, Any], Path] | None:
         content_id, kind, card_id, note_id, storage_key = row
         path = self._file(kind, storage_key or "")
         if path is None or path.is_symlink() or not path.is_file():
+            return None
+        if path.stat().st_size > sync_blobs.MAX_BLOB_BYTES:  # too big to sync: left here, like a missing file
             return None
         interchange = self._interchange(conn, card_id, path.name) if kind == "pdf" else None
         version = f"digest:{interchange['content_digest']}" if interchange else f"sha256:{self._sha(path)}"
@@ -128,7 +201,7 @@ class DocumentFamily:
 
     def read(self, conn: sqlite3.Connection, key: str) -> dict[str, Any] | None:
         card_id, kind = self._parse_key(key)
-        rows = self._rows(conn, " AND card_id=? AND kind=?", (card_id, kind))
+        rows = self._rows(conn, card_id, kind)
         if not rows:
             return None
         found = self._identity(conn, rows[0])
@@ -142,7 +215,7 @@ class DocumentFamily:
     def unavailable(self, conn: sqlite3.Connection, key: str) -> bool:
         """The content row exists but its file does not: not a change, not a deletion."""
         card_id, kind = self._parse_key(key)
-        rows = self._rows(conn, " AND card_id=? AND kind=?", (card_id, kind))
+        rows = self._rows(conn, card_id, kind)
         return bool(rows) and self._identity(conn, rows[0]) is None
 
     def card_id(self, key: str) -> int | None:

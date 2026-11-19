@@ -318,6 +318,7 @@ def _run(addon_dir: str, profile: str, folder: Store, query: Query, is_current: 
     families = families_for(addon_dir, profile)
     # Local file cards exist only as Anki notes: this family reads them through the run's collection.
     families["localfile"].query = query  # type: ignore[attr-defined]
+    families["document"].query = query  # type: ignore[attr-defined]
     families["video"].query = query  # type: ignore[attr-defined]
     store = sync_paths.get_sync_blob_dir(addon_dir, profile)
     usn, scm = collection_usn(query), collection_scm(query)

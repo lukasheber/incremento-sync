@@ -24,12 +24,13 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import paths, sync_paths
+    from . import paths, sync_blobs, sync_paths
     from .sync_anki import Query
     from .sync_blobs import FileHashes, has_blob, materialize, store_file
     from .sync_records import SyncScanError, card_key, split_card_key, value_hash
 except ImportError:
     import paths  # type: ignore[no-redef]
+    import sync_blobs  # type: ignore[no-redef]
     import sync_paths  # type: ignore[no-redef]
     from sync_anki import Query  # type: ignore[no-redef]
     from sync_blobs import FileHashes, has_blob, materialize, store_file  # type: ignore[no-redef]
@@ -125,6 +126,8 @@ class LocalFileFamily:
         _, note_id, relpath = note
         path = self._file(relpath)
         if path is None or path.is_symlink() or not path.is_file():
+            return None
+        if path.stat().st_size > sync_blobs.MAX_BLOB_BYTES:  # too big to sync: left here, like a missing file
             return None
         return {"note_id": note_id, "path": relpath, "version": f"sha256:{self._sha(path)}"}, path
 
