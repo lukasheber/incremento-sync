@@ -12,13 +12,14 @@ from dataclasses import dataclass
 
 from aqt import gui_hooks, mw
 from aqt.qt import QAction, QTimer, qconnect
-from aqt.utils import askUser, tooltip
+from aqt.utils import askUser, openLink, tooltip
 
 from . import host, loader
 from .i18n import t
 
 _SYNC_INTERVAL_MS = 15 * 60 * 1000
 _SYNC_AFTER_OPEN_MS = 20 * 1000
+_UPDATE_CHECK_AFTER_MS = 10 * 1000
 _PHONE_WATCH_MS = 30 * 1000
 #: While phones are served, this computer also sends its own changes this often, so a phone that syncs finds them.
 _PHONE_SEND_SECONDS = 5 * 60
@@ -50,6 +51,36 @@ def start() -> None:
     """Runs once the main window is up (every add-on is loaded): switch on when the config says so."""
     mw.addonManager.setConfigUpdatedAction(_own_name(), lambda _config: apply_config())
     apply_config()
+    QTimer.singleShot(_UPDATE_CHECK_AFTER_MS, check_for_updates)
+
+
+def _update_state() -> str:
+    """Where the last check and a declined version are kept: user_files survives the add-on's own updates."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_files", "update-check.json")
+
+
+def check_for_updates() -> None:
+    """Offer a newer release from GitHub, in the background and at most once a day (``check_for_updates``)."""
+    if not _config().get("check_for_updates", True):
+        return
+    from . import updates
+    from .version import VERSION
+
+    state = _update_state()
+
+    def offer(future) -> None:
+        try:
+            release = future.result()
+        except Exception:
+            return
+        if release is None:
+            return
+        if askUser(t("update_available", latest=release.version, current=VERSION)):
+            openLink(release.url)
+        else:
+            updates.dismiss(state, release.version)
+
+    mw.taskman.run_in_background(lambda: updates.check(state, VERSION, now=time.time()), offer)
 
 
 def apply_config() -> None:

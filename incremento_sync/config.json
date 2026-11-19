@@ -1,3 +1,4 @@
 {
-    "enabled": true
+    "enabled": true,
+    "check_for_updates": true
 }

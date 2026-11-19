@@ -158,3 +158,31 @@ def test_the_window_hears_how_far_a_running_sync_is():
         desktop._heard(sync_service.SyncProgress("preparing", 3, 10))
         assert controller.activity() == desktop.Activity(True, None, sync_service.SyncProgress("preparing", 3, 10))
     """)
+
+
+def test_a_newer_release_is_offered_and_a_declined_one_is_remembered():
+    _run(r"""
+        import json, os
+        from incremento_sync import updates
+        state = os.path.join(desktop._addon_dir, "update-check.json")
+        desktop._update_state = lambda: state
+        desktop._config = lambda: {"check_for_updates": True}
+        class Done:
+            def __init__(self, value): self.value = value
+            def result(self): return self.value
+        desktop.mw.taskman = types.SimpleNamespace(run_in_background=lambda task, done: done(Done(task())))
+        updates.fetch_latest = lambda: {"tag_name": "v9.0.0", "html_url": "https://example.org/v9", "draft": False,
+                                        "prerelease": False}
+        asked, opened = [], []
+        desktop.askUser = lambda text: asked.append(text) or False
+        desktop.openLink = opened.append
+
+        desktop.check_for_updates()
+
+        assert len(asked) == 1 and "9.0.0" in asked[0] and opened == []
+        assert json.load(open(state))["declined"] == "9.0.0"
+        desktop._config = lambda: {"check_for_updates": False}
+        os.remove(state)
+        desktop.check_for_updates()
+        assert len(asked) == 1  # switched off: not even asked
+    """)

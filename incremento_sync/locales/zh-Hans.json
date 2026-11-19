@@ -89,5 +89,6 @@
  "admin_sync_phone_fetching": "{name} 于{when}同步。此电脑还有 {count} 个文档正在传往该设备。",
  "admin_sync_phone_placing": "{name} 于{when}同步。此电脑的部分更改尚未在该设备上生效，将在其下次同步时完成。",
  "admin_sync_phone_tailscale_code": "不在家时（此电脑和手机都需安装并开启 Tailscale）：{code},{address}",
- "admin_sync_phone_tailscale": "不在家时（此电脑和手机都需安装并开启 Tailscale），它的地址是 {address}。"
+ "admin_sync_phone_tailscale": "不在家时（此电脑和手机都需安装并开启 Tailscale），它的地址是 {address}。",
+ "update_available": "Incremento Sync {latest} 已发布（您使用的是 {current}）。是否打开下载页面？"
 }
