@@ -58,6 +58,8 @@ class SyncIdentity:
 class CaptureResult:
     captured: int
     skipped_missing_cards: int
+    #: Records left out because another device would refuse their value: "<key>: <why>".
+    refused: tuple[str, ...] = ()
 
 
 def _meta(conn: sqlite3.Connection) -> dict[str, str]:
@@ -290,12 +292,17 @@ def capture(conn: sqlite3.Connection, families: Mapping[str, Family], resolve_ca
     if not candidates:
         _store_digests(conn, digests)
         return CaptureResult(0, 0)
+    try:
+        from .sync_exchange import check_value
+    except ImportError:
+        from sync_exchange import check_value  # type: ignore[no-redef]
     card_ids = {found for family, key in candidates if (found := family.card_id(key)) is not None}
     cards = resolve_cards(sorted(card_ids))
 
     # 2. One transaction: re-read live values and record what really changed.
     timestamp = int(now())
     captured = skipped = 0
+    refused: list[str] = []
     ordered = sorted(candidates, key=lambda item: (item[0].name, item[1]))
     with_files = sum(1 for family, _ in ordered if getattr(family, "blobs", None) is not None)
     prepared = 0
@@ -327,6 +334,17 @@ def capture(conn: sqlite3.Connection, families: Mapping[str, Family], resolve_ca
                 continue
             if base is not None and base[1] == stored_hash(family, live):
                 continue
+            if live is not None:
+                # Never publish what another device would refuse: one such value used to stop it taking in anything.
+                deps: dict[str, Any] = {"card": card.to_json()} if card is not None else {}
+                if blobs := record_blobs(family, live):
+                    deps["blobs"] = blobs
+                try:
+                    check_value(family, key, live, deps)
+                except ValueError as exc:
+                    refused.append(f"{key}: {exc}")
+                    digests.pop(family.name, None)  # look again next time: a later version may accept it
+                    continue
             record_local_revision(conn, identity, family, key, [base[0]] if base is not None else [], live, card,
                                   timestamp)
             captured += 1
@@ -337,4 +355,4 @@ def capture(conn: sqlite3.Connection, families: Mapping[str, Family], resolve_ca
         raise
     if progress is not None and with_files:
         progress("preparing", with_files, with_files)
-    return CaptureResult(captured, skipped)
+    return CaptureResult(captured, skipped, tuple(refused))

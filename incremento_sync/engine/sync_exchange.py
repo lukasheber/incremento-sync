@@ -79,6 +79,21 @@ class PackError(ValueError):
     pass
 
 
+class ValueRefused(PackError):
+    """A well-formed revision whose value this device does not accept. It is refused alone (its inbox row says why);
+    the rest of its pack is taken in."""
+
+
+#: Raised when what makes a pack refused changes. Since 1, a value this device does not accept is refused alone,
+#: not with its whole pack: packs refused under earlier rules are read again.
+REFUSAL_RULES = 1
+
+
+def _judged_as() -> int:
+    """The format and refusal rules a refused pack is remembered under (kept in ``sync_seen_packs.format``)."""
+    return SYNC_FORMAT + 1000 * REFUSAL_RULES
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -302,26 +317,47 @@ def validate_revision(revision: dict[str, Any], *, library_id: str, device: str,
     deleted = revision["deleted"]
     if not isinstance(deleted, bool) or (deleted != (revision["value"] is None)):
         raise PackError("value: tombstone must have no value and a live revision one")
-    try:
-        family.validate(revision["key"], None if deleted else revision["value"])
-    except ValueError as exc:
-        raise PackError(f"{'key' if 'key' in str(exc) else 'value'}: {exc}") from exc
     deps = revision["deps"]
-    card_id = family.card_id(revision["key"])
-    if not isinstance(deps, dict) or set(deps) - {"card", "blobs"} or ("card" in deps) != (card_id is not None):
+    if not isinstance(deps, dict):
         raise PackError("deps fields")
+    try:
+        family.card_id(revision["key"])
+    except ValueError as exc:
+        raise PackError(f"key: {exc}") from exc
+    try:
+        expected_id = revision_id(library=library_id, family=revision["family"], key=revision["key"],
+                                  parents=parents, device=device, epoch=epoch, seq=seq, deleted=deleted,
+                                  value=revision["value"], deps=deps, format=SYNC_FORMAT)
+    except (TypeError, ValueError) as exc:
+        raise PackError(f"value: {exc}") from exc
+    if revision["id"] != expected_id:
+        raise PackError("id does not match the revision's content")
+    check_value(family, revision["key"], None if deleted else revision["value"], deps)
+
+
+def check_value(family: Family, key: str, value: Any, deps: dict[str, Any]) -> None:
+    """Whether this device accepts a value and its dependencies; raises ValueRefused saying why not.
+
+    Run on what is received, and on what this device is about to publish, so it never publishes what others refuse.
+    """
+    try:
+        family.validate(key, value)
+    except ValueError as exc:
+        raise ValueRefused(f"{'key' if 'key' in str(exc) else 'value'}: {exc}") from exc
+    card_id = family.card_id(key)
+    if set(deps) - {"card", "blobs"} or ("card" in deps) != (card_id is not None):
+        raise ValueRefused("deps fields")
     if card_id is not None:
         try:
             validate_card_deps(card_id, deps)
         except ValueError as exc:
-            raise PackError(f"deps: {exc}") from exc
-    if deps.get("blobs", []) != record_blobs(family, None if deleted else revision["value"]):
-        raise PackError("deps: blobs do not match the value")
-    expected_id = revision_id(library=library_id, family=revision["family"], key=revision["key"],
-                              parents=parents, device=device, epoch=epoch, seq=seq, deleted=deleted,
-                              value=revision["value"], deps=revision["deps"], format=SYNC_FORMAT)
-    if revision["id"] != expected_id:
-        raise PackError("id does not match the revision's content")
+            raise ValueRefused(f"deps: {exc}") from exc
+    try:
+        blobs = record_blobs(family, value)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueRefused(f"value: {exc}") from exc
+    if deps.get("blobs", []) != blobs:
+        raise ValueRefused("deps: blobs do not match the value")
 
 
 def _validate(payload: dict[str, Any], *, library_id: str, device_dir: str, epoch: int, first_seq: int,
@@ -352,14 +388,18 @@ def _validate(payload: dict[str, Any], *, library_id: str, device_dir: str, epoc
         if not isinstance(seq, int) or isinstance(seq, bool) or not previous < seq <= last_seq:
             raise PackError("seq outside the pack or out of order")
         previous = seq
-        validate_revision(revision, library_id=library_id, device=device_dir, epoch=epoch, families=families)
+        try:
+            validate_revision(revision, library_id=library_id, device=device_dir, epoch=epoch, families=families)
+        except ValueRefused as exc:
+            revision["refused"] = str(exc)  # taken in as refused: the rest of the pack is not held up
     if previous != last_seq:
         raise PackError("seq range")
     return revisions
 
 
 def _store(conn: sqlite3.Connection, revisions: list[dict[str, Any]], *, device: str, epoch: int, now: int) -> int:
-    """Record validated revisions and their inbox rows; returns how many were new."""
+    """Record validated revisions and their inbox rows; returns how many were new. A refused revision is recorded
+    as rejected, with why: settled, so later changes of the same device are not held up by it."""
     new = 0
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -377,8 +417,10 @@ def _store(conn: sqlite3.Connection, revisions: list[dict[str, Any]], *, device:
                      canonical_json(revision["deps"]), SYNC_FORMAT, now))
             except sqlite3.IntegrityError as exc:
                 raise PackError(f"seq reused by a different revision: {exc}") from exc
+            refused = revision.get("refused")
             conn.execute("INSERT INTO sync_inbox(revision_id, status, reason, received_at, updated_at) "
-                         "VALUES (?, 'pending_parent', '', ?, ?)", (revision["id"], now, now))
+                         "VALUES (?, ?, ?, ?, ?)", (revision["id"], "rejected" if refused else "pending_parent",
+                                                    f"refused: {refused}"[:500] if refused else "", now, now))
             new += 1
         conn.commit()
     except BaseException:
@@ -467,7 +509,8 @@ def _record_peer(conn: sqlite3.Connection, store: Store, device_rel: str, name: 
 def _remember(conn: sqlite3.Connection, device: str, name: str, outcome: str, now: int) -> None:
     with conn:
         conn.execute("INSERT OR REPLACE INTO sync_seen_packs(device, name, outcome, format, seen_at) "
-                     "VALUES (?, ?, ?, ?, ?)", (device, name, outcome, SYNC_FORMAT, now))
+                     "VALUES (?, ?, ?, ?, ?)", (device, name, outcome, _judged_as() if outcome == "rejected"
+                                                else SYNC_FORMAT, now))
 
 
 def sample_card_refs(root: Path | Store, library_id: str, limit: int = 50) -> dict[int, str]:
@@ -550,10 +593,11 @@ def receive(conn: sqlite3.Connection, root: Path | Store, families: Mapping[str,
             match = _PACK_NAME.match(entry.name)
             if match:
                 names.append((int(match[1]), int(match[2]), match[3], entry))
-        # A rejection only stands for the format it was judged under: an upgrade reads the pack again.
+        # A refusal only stands for the format and the rules it was judged under: an upgrade reads the pack again,
+        # as it does packs that earlier versions refused whole over one value.
         seen = {row[0] for row in conn.execute(
             "SELECT name FROM sync_seen_packs WHERE device=? AND (outcome='accepted' OR format=?)",
-            (device.name, SYNC_FORMAT))}
+            (device.name, _judged_as()))}
         for epoch, first_seq, digest, entry in sorted(names, key=lambda item: item[:2]):
             label = f"{device.name}/{entry.name}"
             if entry.name in seen:
@@ -582,6 +626,8 @@ def receive(conn: sqlite3.Connection, root: Path | Store, families: Mapping[str,
                                       epoch=epoch, first_seq=first_seq, families=families)
                 _store(conn, revisions, device=device.name, epoch=epoch, now=timestamp)
                 _remember(conn, device.name, entry.name, "accepted", timestamp)
+                result.problems += [f"{label}: {revision['key']} left out: {revision['refused']}"
+                                    for revision in revisions if revision.get("refused")]
             except PackError as exc:
                 result.problems.append(f"{label}: {exc}")
                 result.rejected += 1

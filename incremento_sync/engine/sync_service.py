@@ -330,8 +330,7 @@ def _run(addon_dir: str, profile: str, folder: Store, query: Query, is_current: 
 
     report = SyncReport()
     steps: list[Callable[[], None]] = [
-        lambda: setattr(report, "captured", report.captured + capture(conn, families, resolver, now=now, collection_state=state,
-                                                                    progress=progress).captured),
+        lambda: _captured(report, capture(conn, families, resolver, now=now, collection_state=state, progress=progress)),
         lambda: setattr(report, "published", report.published + publish(
             conn, folder, anki_usn=usn, anki_scm=scm, blob_store=store, now=now, budget=budget, progress=progress).revisions_published),
         lambda: _catch_up(conn, folder, families, now),
@@ -343,8 +342,7 @@ def _run(addon_dir: str, profile: str, folder: Store, query: Query, is_current: 
         lambda: _release_retired(report, conn, folder, store, lambda: apply(
             conn, families, resolver, collection_usn=usn, collection_scm=scm, blob_store=store, now=now), now),
         # Local edits protected during apply are published in the same run.
-        lambda: setattr(report, "captured", report.captured + capture(conn, families, resolver, now=now, collection_state=state,
-                                                                    progress=progress).captured),
+        lambda: _captured(report, capture(conn, families, resolver, now=now, collection_state=state, progress=progress)),
         lambda: setattr(report, "published", report.published + publish(
             conn, folder, anki_usn=usn, anki_scm=scm, blob_store=store, now=now, budget=budget, progress=progress).revisions_published),
     ]
@@ -535,6 +533,12 @@ def sweep_blobs_now(folder: Path | Store, library_id: str, *, now: float) -> int
     return sweep_blobs(folder, library_id, now=now, grace_seconds=BLOB_GRACE_SECONDS)
 
 
+def _captured(report: SyncReport, result: Any) -> None:
+    report.captured += result.captured
+    report.problems += [f"left out, other devices would refuse it: {why}" for why in result.refused
+                        if f"left out, other devices would refuse it: {why}" not in report.problems]
+
+
 def _receive(report: SyncReport, result: Any) -> None:
     report.received += result.received
     report.problems += result.problems
@@ -713,8 +717,11 @@ def inventory(addon_dir: str, profile: str, query: Query, *, store: Store | None
                 counts["preparing"] += 1
     deliveries = []
     for device, (received, waiting) in sorted(_announced(addon_dir, profile, store=store).items()):
-        have = sum(1 for author, epoch, seq in ready if author == device or seq <= _through(received, author, epoch))
-        fetching = min(waiting, len(ready) - have)
+        # A device that started from a snapshot knows every change while files still come, so the files it waits
+        # for are taken from what its receipt covers; one taking changes in order waits for files past its receipt.
+        known = sum(1 for author, epoch, seq in ready if author == device or seq <= _through(received, author, epoch))
+        fetching = min(waiting, len(ready))
+        have = min(known, len(ready) - fetching)
         deliveries.append((device, Delivery(have, fetching, len(ready) - have - fetching)))
     return Inventory(found=sum(counts.values()), left_out=tuple(left_out), deliveries=tuple(deliveries), **counts)
 
@@ -768,6 +775,9 @@ def diagnostics(addon_dir: str, profile: str, query: Query | None, *, extra: dic
                                "GROUP BY status, reason ORDER BY count(*) DESC LIMIT 10").fetchall()
         out = [f"Changes not sent yet: {unsent}"] + [f"Received, {name}: {count}" for name, count in inbox]
         out += [f"  {name} because {reason}: {count}" for name, reason, count in reasons]
+        refused = _refused_own(conn, families_for(addon_dir, profile))
+        out.append(f"Published changes other devices refuse: {len(refused)}")
+        out += [f"  {why}" for why in refused[:LEFT_OUT_NAMED]]
         return out
 
     def devices() -> list[str]:
@@ -785,6 +795,30 @@ def diagnostics(addon_dir: str, profile: str, query: Query | None, *, extra: dic
     if len(home) > 3:
         report = report.replace(home, "~").replace(home.replace("\\", "/"), "~")
     return report
+
+
+def _refused_own(conn: Any, families: dict[str, Family]) -> list[str]:
+    """This device's published changes that other devices refuse ("<key>: <why>"), as earlier versions could
+    publish them: each one used to stop another device taking in anything else of its pack."""
+    try:
+        from .sync_exchange import check_value
+    except ImportError:
+        from sync_exchange import check_value  # type: ignore[no-redef]
+    identity = sync_identity(conn)
+    if identity is None:
+        return []
+    refused = []
+    for family_name, key, value, deps in conn.execute(
+            "SELECT family, key, value, deps FROM sync_revisions WHERE device=? AND deleted=0 ORDER BY epoch, seq",
+            (identity.device_id,)):
+        family = families.get(family_name)
+        if family is None:
+            continue
+        try:
+            check_value(family, key, json.loads(value), json.loads(deps))
+        except ValueError as exc:
+            refused.append(f"{key}: {exc}")
+    return refused
 
 
 def _when(timestamp: int | None) -> str:

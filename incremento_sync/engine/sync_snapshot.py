@@ -23,7 +23,7 @@ try:
     from .sync_capture import sync_identity
     from .sync_exchange import (
         MAX_PACK_BYTES, MAX_PACK_REVISIONS, PackError, _parse, decode_snapshot_part, library_rel, sha256_bytes,
-        validate_revision,
+        ValueRefused, validate_revision,
     )
     from .sync_records import SYNC_FORMAT, Family, canonical_json
     from .sync_store import Store, StoreError, as_store
@@ -32,7 +32,7 @@ except ImportError:
     from sync_capture import sync_identity  # type: ignore[no-redef]
     from sync_exchange import (  # type: ignore[no-redef]
         MAX_PACK_BYTES, MAX_PACK_REVISIONS, PackError, _parse, decode_snapshot_part, library_rel, sha256_bytes,
-        validate_revision,
+        ValueRefused, validate_revision,
     )
     from sync_store import Store, StoreError, as_store  # type: ignore[no-redef]
     from sync_records import SYNC_FORMAT, Family, canonical_json  # type: ignore[no-redef]
@@ -277,7 +277,11 @@ def load_snapshot(root: Path | Store, library_id: str, device: str, families: Ma
                           and not isinstance(epoch, bool) and epoch >= 1):
                     return None
                 body = {key: value for key, value in revision.items() if key not in ("device", "epoch")}
-                validate_revision(body, library_id=library_id, device=rev_device, epoch=epoch, families=families)
+                try:
+                    validate_revision(body, library_id=library_id, device=rev_device, epoch=epoch,
+                                      families=families)
+                except ValueRefused as exc:
+                    revision = {**revision, "refused": str(exc)}
                 revisions.append(revision)
         except PackError:
             return None
@@ -352,8 +356,11 @@ def catch_up(conn: sqlite3.Connection, root: Path | Store, families: Mapping[str
                  canonical_json(revision["deps"]), SYNC_FORMAT, timestamp))
             # A revision that needs files waits for them, so receiving fetches them before apply.
             status = "pending_blob" if revision["deps"].get("blobs") else "received"
+            reason = "from snapshot"
+            if revision.get("refused"):
+                status, reason = "rejected", f"refused: {revision['refused']}"[:500]
             conn.execute("INSERT OR IGNORE INTO sync_inbox(revision_id, status, reason, received_at, updated_at) "
-                         "VALUES (?, ?, 'from snapshot', ?, ?)", (revision["id"], status, timestamp, timestamp))
+                         "VALUES (?, ?, ?, ?, ?)", (revision["id"], status, reason, timestamp, timestamp))
         for device, epochs in best.receipts.items():
             if device == identity.device_id:
                 continue

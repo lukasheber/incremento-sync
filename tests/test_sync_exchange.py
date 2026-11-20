@@ -283,8 +283,10 @@ def _encode(payload):
     (lambda p: p.update(library="another-library"), "library"),
     (lambda p: p.update(device="someone-else"), "device"),
     (lambda p: p["revisions"][0].update(family="unknown_family"), "family"),
-    (lambda p: p["revisions"][0].update(value={"priority": 40.0, "extra": 1}), "value"),
-    (lambda p: p["revisions"][0].update(value={"priority": "NaN"}), "value"),
+    # A value changed after its id was made: tampered, so the whole pack goes. (A bad value under its own id is
+    # refused alone: tests/test_sync_refused.py.)
+    (lambda p: p["revisions"][0].update(value={"priority": 40.0, "extra": 1}), "id"),
+    (lambda p: p["revisions"][0].update(value={"priority": "NaN"}), "id"),
     (lambda p: p["revisions"][0].update(key="../../etc/passwd"), "key"),
     (lambda p: p["revisions"][0].update(seq=999), "seq"),
     (lambda p: p["revisions"][0]["value"].update(priority=99.0), "id"),

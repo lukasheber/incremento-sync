@@ -257,3 +257,20 @@ def test_the_inventory_says_how_many_files_each_device_has_is_fetching_and_has_n
     assert before.get(b_id, sync_service.Delivery(0, 0, DOCUMENTS)).have == 0
     assert early.have + early.fetching + early.waiting == DOCUMENTS and early.fetching > 0 and early.have < DOCUMENTS
     assert done == sync_service.Delivery(have=DOCUMENTS, fetching=0, waiting=0)
+
+
+def test_a_document_recorded_without_its_note_does_not_stop_the_other_device_taking_in_the_rest(tmp_path):
+    store = MemoryStore()
+    a, b = Device(tmp_path, "a", store), Device(tmp_path, "b", store)
+    a.add_documents(DOCUMENTS)
+    with db.get_connection(a.addon, "P") as conn:  # Incremento recorded this one without its note
+        conn.execute("UPDATE content_items SET note_id = NULL WHERE card_id = 3")
+    a.sync()
+
+    while b.sync(budget=0.0)[0].more:
+        pass
+
+    placed = sorted(p.name for p in paths.get_pdf_dir(b.addon, "P").glob("*.pdf"))
+    assert placed == [f"book{index}.pdf" for index in range(1, DOCUMENTS + 1)], placed
+    b_id = sync_service.sync_identity(db.get_connection(b.addon, "P")).device_id
+    assert sync_service.peer_progress(a.addon, "P", store=store)[b_id] == sync_service.PeerProgress(0, 0)

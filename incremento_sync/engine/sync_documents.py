@@ -145,6 +145,16 @@ class DocumentFamily:
             raise SyncScanError(f"the Anki collection could not be read: {exc}") from exc
         return found
 
+    def _card_note(self, card_id: int) -> int | None:
+        """The note of ``card_id`` in the collection, or None (no collection, or no such card)."""
+        if self.query is None:
+            return None
+        try:
+            found = self.query("SELECT nid FROM cards WHERE id = ?", card_id)
+        except sqlite3.OperationalError:
+            return None
+        return int(found[0][0]) if found else None
+
     def _rows(self, conn: sqlite3.Connection, card_id: int | None = None, kind: str | None = None) -> list[tuple]:
         """(content id, kind, card id, note id, storage key) of every document, as Incremento's reader finds them.
 
@@ -163,6 +173,8 @@ class DocumentFamily:
         for content_id, row_kind, row_card, note_id, storage_key in rows:
             recorded.add((row_kind, row_card))
             note = notes.get((row_kind, row_card))
+            if not note_id:  # recorded without its note (it happens): the card's note, as on every device
+                note_id = note[0] if note is not None else self._card_note(row_card)
             if note is not None:
                 folder = KINDS[row_kind][0]
                 current = self._file(row_kind, storage_key or "")
