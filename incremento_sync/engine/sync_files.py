@@ -131,6 +131,22 @@ class LocalFileFamily:
             return None
         return {"note_id": note_id, "path": relpath, "version": f"sha256:{self._sha(path)}"}, path
 
+    def inventory(self, conn: sqlite3.Connection, known: set[str]) -> list[tuple[str, str, str | None, Any]]:
+        """(key, file name, why it is left out or None, value or None) of every local file the collection names.
+
+        The value is read only for keys in ``known`` (already synced once), so counting a new collection does not
+        hash every file.
+        """
+        found = []
+        for note in self._notes():
+            key = f"{card_key(note[0])}/localfile"
+            path = self._file(note[2])
+            problem = sync_blobs.left_out(path)
+            identity = self._identity(note) if problem is None and key in known else None
+            found.append((key, path.name if path is not None else note[2], problem, identity[0] if identity else None))
+        self._hashes.save()
+        return found
+
     # --- the Family interface ------------------------------------------------------
 
     def scan(self, conn: sqlite3.Connection) -> Iterable[tuple[str, dict[str, Any]]]:

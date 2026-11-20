@@ -205,6 +205,15 @@ class PhoneServer:
                 progress[name] = mine  # a phone paired again has one folder per pairing: the last one listed wins
         return progress
 
+    def owners(self) -> dict[str, str]:
+        """Which paired phone owns each device folder (device id -> the name it was paired as)."""
+        try:
+            owners = json.loads(self._owners.read_text(encoding="utf-8"))["owners"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+        paired = set(self.book.devices())
+        return {device: name for device, name in owners.items() if isinstance(name, str) and name in paired}             if isinstance(owners, dict) else {}
+
     def remove(self, name: str) -> bool:
         removed = self.book.revoke(name)
         with self._lock:

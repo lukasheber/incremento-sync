@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from aqt import gui_hooks, mw
 from aqt.qt import QAction, QTimer, qconnect
-from aqt.utils import askUser, openLink, tooltip
+from aqt.utils import askUser, openLink, showWarning, tooltip
 
 from . import host, loader
 from .i18n import t
@@ -232,6 +232,84 @@ class _Controller:
     def resolve(self, conflict_id: int, value) -> None:
         _service().resolve(_addon_dir, self.profile, conflict_id, value, mw.col.db.all)
 
+    # -- What it found, and a report for help --
+    # Both run beside a sync (not queued behind it on the collection), so the window answers while files move.
+
+    def inventory(self, done) -> None:
+        """Count the collection's documents and files in the background; ``done`` hears an Inventory, or None."""
+        profile, query = self.profile, mw.col.db.all if mw.col is not None else None
+        if query is None:
+            done(None)
+            return
+
+        def counted(future) -> None:
+            try:
+                found = future.result()
+            except Exception as error:
+                _service().log(_addon_dir, profile, f"counting documents failed: {type(error).__name__}: {error}")
+                found = None
+            done(found)
+
+        server = _phone if _phone_profile == profile else None
+        owners = server.owners if server is not None else None
+        mw.taskman.run_in_background(
+            lambda: _by_name(_service().inventory(_addon_dir, profile, query), owners() if owners else None), counted)
+
+    def save_log(self, path: str, done) -> None:
+        """Write the report for help to ``path``; ``done`` hears None, or why it could not be written."""
+        profile, query = self.profile, mw.col.db.all if mw.col is not None else None
+        extra = self._about()
+
+        def write() -> None:
+            report = _service().diagnostics(_addon_dir, profile, query, extra=extra)
+            with open(path, "w", encoding="utf-8", newline="\r\n" if os.name == "nt" else "\n") as stream:
+                stream.write(report)
+
+        def written(future) -> None:
+            try:
+                future.result()
+            except Exception as error:
+                done(str(error) or type(error).__name__)
+                return
+            done(None)
+
+        mw.taskman.run_in_background(write, written)
+
+    def _about(self) -> dict:
+        """What the report says about this Anki, read on the main thread. Never a code, key or address."""
+        import platform
+
+        from .version import VERSION
+
+        about = {"Add-on version": VERSION, "Incremento version": _incremento_version(),
+                 "Anki version": _anki_version(), "System": platform.platform(),
+                 "Python": platform.python_version()}
+        info = self.phone()
+        if _service().status(_addon_dir, self.profile).folder and info is not None:
+            about["Phone server"] = "running" if info.running else "not running"
+            for phone in info.phones:
+                seen = time.strftime("%Y-%m-%d %H:%M", time.localtime(phone.seen)) if phone.seen else "never"
+                about[f"Phone {phone.name}"] = f"last synced {seen}"
+        about["Last error this session"] = _last_error or "none"
+        return about
+
+
+def _by_name(inventory, owners: dict | None):
+    """The inventory with each device's counts under the name the window shows: the phone's paired name (devices
+    no paired phone owns are left out), or, syncing through a folder or another computer, "" for the device furthest
+    along. A phone paired again has a folder per pairing: the one furthest along is the phone now."""
+    import dataclasses
+
+    best: dict[str, object] = {}
+    for device, delivery in inventory.deliveries:
+        name = "" if owners is None else owners.get(device)
+        if name is None:
+            continue
+        known = best.get(name)
+        if known is None or delivery.have + delivery.fetching > known.have + known.fetching:
+            best[name] = delivery
+    return dataclasses.replace(inventory, deliveries=tuple(sorted(best.items())))
+
 
 @dataclass(frozen=True)
 class PhoneInfo:
@@ -309,10 +387,47 @@ def _phone_changed() -> None:
         start_background_sync()
 
 
-def open_dialog() -> None:
-    from .sync_dialog import SyncDialog
+def _anki_version() -> str:
+    try:
+        from aqt import appVersion
 
-    SyncDialog(_profile_name(), _Controller(_profile()), mw).exec()
+        return str(appVersion)
+    except Exception:
+        return "unknown"
+
+
+def _incremento_version() -> str:
+    """Incremento's version as its manifest or its own module says, or "unknown"."""
+    import json
+
+    for name in ("manifest.json", "meta.json"):
+        try:
+            with open(os.path.join(_addon_dir, name), encoding="utf-8") as stream:
+                data = json.load(stream)
+        except (OSError, ValueError):
+            continue
+        for key in ("human_version", "version"):
+            if isinstance(data, dict) and data.get(key):
+                return str(data[key])
+    return str(getattr(_incremento, "__version__", "unknown"))
+
+
+def open_dialog() -> None:
+    """Open the sync window; a window that cannot open says why instead of doing nothing."""
+    try:
+        from .sync_dialog import SyncDialog
+
+        dialog = SyncDialog(_profile_name(), _Controller(_profile()), mw)
+    except Exception as error:
+        import traceback
+
+        try:
+            _service().log(_addon_dir, _profile(), "the sync window could not open:\n" + traceback.format_exc().rstrip())
+        except Exception:
+            pass
+        showWarning(t("admin_sync_open_failed", error=f"{type(error).__name__}: {error}"))
+        return
+    dialog.exec()
 
 
 def remove_data() -> None:

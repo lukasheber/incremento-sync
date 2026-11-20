@@ -36,6 +36,15 @@ KEEP_ONE_COPY = (sys.platform == "android" or hasattr(sys, "getandroidapilevel")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
+def left_out(path: Path | None, limit: int | None = None) -> str | None:
+    """Why the file at ``path`` cannot sync: "missing" (not here, or not a plain file), "too_big", or None."""
+    if path is None or path.is_symlink() or not path.is_file():
+        return "missing"
+    if path.stat().st_size > (MAX_BLOB_BYTES if limit is None else limit):
+        return "too_big"
+    return None
+
+
 class Budget:
     """A time allowance for the file transfer in one sync call; ``seconds`` of None means no limit.
 

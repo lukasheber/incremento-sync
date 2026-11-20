@@ -228,7 +228,7 @@ def test_once_the_phone_is_paired_the_code_goes_away_and_the_status_shows():
         assert dialog._mode_heading.text() == "Syncing with your phone"
         assert "pixel is paired" in dialog._status.text()
         assert shown(dialog._pair_another) and shown(dialog._remove) and not shown(dialog._change)
-        assert not shown(dialog._sync)  # a phone syncs by itself
+        assert shown(dialog._sync)  # a phone syncs by itself, and Sync now prepares changes for it at once
         assert "closing this window does not stop it" in dialog._how.text()
         assert dialog._ticker.interval() == sync_dialog.STATUS_TICK_MS
     """)
@@ -263,7 +263,7 @@ def test_pairing_another_phone_can_be_cancelled_back_to_the_status():
 def test_a_phone_server_that_is_not_running_says_so():
     _run(r"""
         dialog = sync_dialog.SyncDialog("Main", Controller(folder=PHONE, running=False))
-        assert shown(dialog._status_page) and "not running" in dialog._status.text()
+        assert shown(dialog._status_page) and shown(dialog._error) and "not running" in dialog._error.text()
     """)
 
 
@@ -513,4 +513,162 @@ def test_pairing_also_shows_the_tailscale_address_when_there_is_one():
         assert "099118,192.168.1.20" in text and "Tailscale" in text and "099118,100.78.202.115" in text
         plain = sync_dialog.SyncDialog("Main", Controller(folder=PHONE, code="099 118"))
         assert "Tailscale" not in plain._address.text()
+    """)
+
+
+# --- What it found, and a report to save for help ------------------------------------------------------------------
+
+def test_the_overview_says_how_many_are_on_the_phone_on_their_way_left_and_cannot_sync():
+    _run(r"""
+        from sync_service import Delivery, Inventory
+        found = Inventory(found=47, ready=40, preparing=3, missing=3, too_big=1,
+                          left_out=(("missing", "a.pdf"), ("missing", "b.pdf"), ("missing", "c.pdf"),
+                                    ("too_big", "huge.pdf")),
+                          deliveries=(("Pixel", Delivery(have=30, fetching=6, waiting=4)),))
+        view = sync_dialog.overview(found, target="Pixel")
+        assert view.headline == "30 of 43 documents and files are on Pixel · 13 left", view.headline
+        assert view.percent == 69
+        tiles = {tile.key: (tile.count, tile.label) for tile in view.tiles}
+        assert tiles == {"have": (30, "On Pixel"), "fetching": (6, "Downloading to Pixel"),
+                         "waiting": (4, "Waiting for Pixel"), "preparing": (3, "Preparing on this computer"),
+                         "cannot": (4, "Can't sync")}, tiles
+        assert [count for _, count in view.segments] == [30, 6, 4, 3, 4]
+        assert view.left_out == ["Not on this computer: a.pdf, b.pdf, c.pdf", "Over 512 MB: huge.pdf"], view.left_out
+
+        done = sync_dialog.overview(Inventory(found=5, ready=5, deliveries=(("Pixel", Delivery(5, 0, 0)),)), target="Pixel")
+        assert done.headline == "All 5 documents and files are on Pixel" and done.percent == 100 and done.complete
+
+        # A phone that has not said what it has: what is ready here, and why the rest is not known.
+        unknown = sync_dialog.overview(Inventory(found=10, ready=7, preparing=3), target="Pixel")
+        assert unknown.headline == "7 of 10 documents and files are ready to sync", unknown.headline
+        assert [tile.key for tile in unknown.tiles] == ["ready", "preparing", "cannot"]
+        assert "Pixel has not said yet which ones it has" in unknown.note
+
+        assert sync_dialog.overview(None, counting=True).headline == "Counting documents and files…"
+        assert sync_dialog.overview(Inventory()).headline == "No PDFs, EPUBs, local files or videos found in this collection"
+    """)
+
+
+def test_the_window_shows_the_overview_counts_when_it_opens_and_again_after_a_sync():
+    _run(r"""
+        from sync_service import Delivery, Inventory
+
+        class Counting(Controller):
+            asked = []
+            def inventory(self, done):
+                self.asked.append(done)
+
+        controller = Counting(folder=PHONE, phones=[phone(seen=NOW)], last_sync=NOW, published=NOW - 60)
+        dialog = sync_dialog.SyncDialog("Main", controller)
+        assert len(controller.asked) == 1 and dialog._headline.text() == "Counting documents and files…"
+        dialog.refresh()
+        assert len(controller.asked) == 1  # one count at a time
+
+        controller.asked[0](Inventory(found=7, ready=5, preparing=2, deliveries=(("pixel", Delivery(3, 1, 1)),)))
+        assert dialog._headline.text() == "3 of 7 documents and files are on pixel · 4 left"
+        assert dialog._tiles["have"].count() == "3" and dialog._tiles["fetching"].count() == "1"
+        assert dialog._tiles["preparing"].count() == "2" and shown(dialog._bar)
+        assert "pixel synced" in dialog._status.text()  # the details stay below
+
+        dialog._sync.click()
+        controller.done()
+        assert len(controller.asked) == 2  # a sync changes how far they are
+
+        controller.asked[1](None)  # counting failed: the last counts stay and nothing is said to be wrong
+        assert dialog._headline.text() == "3 of 7 documents and files are on pixel · 4 left"
+    """)
+
+
+def test_an_error_shows_as_a_banner_above_everything():
+    _run(r"""
+        controller = Controller(folder="C:/Cloud", last_sync=NOW, error="disk full")
+        dialog = sync_dialog.SyncDialog("Main", controller)
+        assert shown(dialog._error) and "disk full" in dialog._error.text()
+        controller.error = None
+        dialog.refresh()
+        assert not shown(dialog._error)
+    """)
+
+
+def test_save_log_writes_the_report_where_the_user_chooses_and_says_where():
+    _run(r"""
+        said = []
+        sync_dialog.showInfo = lambda text, **kw: said.append(("info", text))
+        sync_dialog.showWarning = lambda text, **kw: said.append(("warning", text))
+        sync_dialog.QFileDialog.getSaveFileName = staticmethod(lambda *a, **kw: ("C:/Users/me/report.txt", ""))
+
+        class Saving(Controller):
+            def save_log(self, path, done):
+                self.calls.append(("save_log", path))
+                done(None if path.endswith(".txt") else "disk full")
+
+        controller = Saving()  # nothing set up yet: the report still helps
+        dialog = sync_dialog.SyncDialog("Main", controller)
+        assert shown(dialog._save_log) and dialog._save_log.isFlat()
+        dialog._save_log.click()
+        assert controller.calls == [("save_log", "C:/Users/me/report.txt")]
+        assert said[-1][0] == "info" and "C:/Users/me/report.txt" in said[-1][1]
+
+        sync_dialog.QFileDialog.getSaveFileName = staticmethod(lambda *a, **kw: ("C:/full/report.log", ""))
+        dialog._save_log.click()
+        assert said[-1][0] == "warning" and "disk full" in said[-1][1]
+
+        sync_dialog.QFileDialog.getSaveFileName = staticmethod(lambda *a, **kw: ("", ""))  # cancelled
+        dialog._save_log.click()
+        assert len(controller.calls) == 2
+    """)
+
+
+def test_lines_that_arrive_after_the_window_opened_are_not_cut_off():
+    _run(r"""
+        from sync_service import Inventory
+
+        class Counting(Controller):
+            asked = []
+            def inventory(self, done):
+                self.asked.append(done)
+
+        controller = Counting(folder=PHONE, phones=[phone(seen=NOW)], last_sync=NOW, published=NOW - 60)
+        dialog = sync_dialog.SyncDialog("Main", controller)
+        dialog.show()
+        app.processEvents()
+        controller.asked[0](Inventory(found=9, ready=4, preparing=2, missing=2, too_big=1,
+                                      left_out=(("missing", "a.pdf"), ("missing", "b.pdf"), ("too_big", "c.pdf"))))
+        for _ in range(5):
+            app.processEvents()
+        label = dialog._left_out
+        assert "Not on this computer" in label.text()
+        assert label.height() >= label.heightForWidth(label.width()), (label.height(), label.heightForWidth(label.width()))
+        grown = dialog.height()
+
+        dialog._inventory = Inventory(found=2, ready=2)  # the files are back: the window gives the room back
+        dialog.refresh()
+        for _ in range(5):
+            app.processEvents()
+        assert dialog.height() < grown, (dialog.height(), grown)
+    """)
+
+
+def test_a_phone_that_syncs_is_counted_again_at_once_and_nothing_left_is_called_up_to_date():
+    _run(r"""
+        from sync_service import Delivery, Inventory
+
+        class Counting(Controller):
+            asked = []
+            def inventory(self, done):
+                self.asked.append(done)
+
+        controller = Counting(folder=PHONE, phones=[phone(seen=NOW - 600)], last_sync=NOW, published=NOW - 900)
+        dialog = sync_dialog.SyncDialog("Main", controller)
+        controller.asked[0](Inventory(found=5, ready=5, deliveries=(("pixel", Delivery(4, 0, 1)),)))
+        # The phone has everything sent before it last synced, but one file is still left: not "up to date".
+        assert "Everything is up to date" not in dialog._status.text()
+
+        controller.phones = [phone(seen=NOW)]  # the phone just synced
+        dialog.refresh()
+        assert len(controller.asked) == 2
+        controller.asked[1](Inventory(found=5, ready=5, deliveries=(("pixel", Delivery(5, 0, 0)),)))
+        assert "Everything is up to date" in dialog._status.text()
+        dialog.refresh()
+        assert len(controller.asked) == 2  # nothing new: no count
     """)

@@ -18,6 +18,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,7 +46,7 @@ try:
     from .sync_snapshot import catch_up, history_complete, retire_packs, sweep_blobs, write_snapshot_if_due
     from .sync_http import HttpStore, Pairing
     from .sync_store import LocalStore, Store, StoreError, as_store
-    from .sync_records import FAMILIES, Family
+    from .sync_records import FAMILIES, Family, record_hash
 except ImportError:
     import paths as _paths  # type: ignore[no-redef]
     import sync_paths  # type: ignore[no-redef]
@@ -73,7 +74,7 @@ except ImportError:
     )
     from sync_http import HttpStore, Pairing  # type: ignore[no-redef]
     from sync_store import LocalStore, Store, StoreError, as_store  # type: ignore[no-redef]
-    from sync_records import FAMILIES, Family  # type: ignore[no-redef]
+    from sync_records import FAMILIES, Family, record_hash  # type: ignore[no-redef]
 
 
 #: Write a snapshot after this many revisions published or integrated since the last one ...
@@ -556,22 +557,238 @@ def sync_now(addon_dir: str, profile: str, query: Query, *, is_current: Callable
     conn = get_connection(addon_dir, profile)
     folder = _meta(conn, "folder") if sync_identity(conn) is not None else None
     if folder is None:
+        log(addon_dir, profile, "sync skipped: not set up")
         return SyncReport(skipped="not configured")
     lock = _lock(addon_dir, profile)
     if not lock.acquire(blocking=False):
         return SyncReport(skipped="already running")
     try:
+        log(addon_dir, profile, f"sync started ({'publish only' if publish_only else 'full'}, with {_where(folder)})")
         ensure_device_binding(addon_dir, profile)
         owned = store is None
-        target = store if store is not None else store_for(addon_dir, profile, folder)
         try:
-            return _run(addon_dir, profile, target, query, is_current, now, publish_only=publish_only,
-                        budget=Budget(budget_seconds), progress=_listener(on_progress))
-        finally:
-            if owned and hasattr(target, "close"):
-                target.close()
+            target = store if store is not None else store_for(addon_dir, profile, folder)
+            try:
+                report = _run(addon_dir, profile, target, query, is_current, now, publish_only=publish_only,
+                              budget=Budget(budget_seconds), progress=_listener(on_progress))
+            finally:
+                if owned and hasattr(target, "close"):
+                    target.close()
+        except Exception as exc:
+            log(addon_dir, profile, f"sync failed: {type(exc).__name__}: {exc}\n{traceback.format_exc().rstrip()}")
+            raise
+        log(addon_dir, profile, "sync finished: " + _summary(report))
+        return report
     finally:
         lock.release()
+
+
+def _where(folder: str) -> str:
+    """What kind of sync location ``folder`` is, without its address or path."""
+    if folder.startswith("phone:"):
+        return "a phone"
+    if folder.startswith("hub:"):
+        return "the computer (over the network)"
+    return "a folder"
+
+
+def _summary(report: SyncReport) -> str:
+    parts = [f"captured {report.captured}", f"published {report.published}", f"received {report.received}",
+             f"applied {report.applied}", f"conflicts {report.conflicts}",
+             f"files to send {report.files_to_send} ({report.bytes_to_send} bytes)",
+             f"files to receive {report.files_to_receive}"]
+    if report.skipped:
+        parts.insert(0, f"stopped: {report.skipped}")
+    if report.more:
+        parts.append("more to do")
+    if report.problems:
+        parts.append(f"{len(report.problems)} problem(s): " + "; ".join(report.problems[:5]))
+    return ", ".join(parts)
+
+
+# --- the log, the inventory and the report to save for help ---------------------------------------------------
+
+LOG_FILE = "sync.log"
+#: The log keeps its most recent lines within this size.
+LOG_MAX_BYTES = 256 * 1024
+_log_guard = threading.Lock()
+
+
+def log_path(addon_dir: str, profile: str) -> Path:
+    return sync_paths.get_sync_dir(addon_dir, profile) / LOG_FILE
+
+
+def log(addon_dir: str, profile: str, message: str) -> None:
+    """Add a dated line to the profile's sync log. Never fails: a log that cannot be written is skipped."""
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n".encode("utf-8", "replace")
+    path = log_path(addon_dir, profile)
+    with _log_guard:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            size = path.stat().st_size if path.exists() else 0
+            if size + len(line) <= LOG_MAX_BYTES:
+                with path.open("ab") as stream:
+                    stream.write(line)
+                return
+            # Keep the newest half, from a line's start.
+            kept = (path.read_bytes() + line)[-(LOG_MAX_BYTES // 2):]
+            start = kept.find(b"\n")
+            kept = kept[start + 1:] if 0 <= start < len(kept) - 1 else line[-(LOG_MAX_BYTES // 2):]
+            path.write_bytes(kept)
+        except OSError:
+            pass
+
+
+def read_log(addon_dir: str, profile: str, *, lines: int = 200) -> list[str]:
+    try:
+        text = log_path(addon_dir, profile).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return text.splitlines()[-lines:]
+
+
+#: At most this many left-out files are named, in the inventory and in the report.
+LEFT_OUT_NAMED = 50
+
+
+@dataclass(frozen=True)
+class Delivery:
+    """How far one other device is with the documents and files that are ready here (``Inventory.ready``).
+
+    ``have``: placed on that device; ``fetching``: it has the change and is downloading the file; ``waiting``: it has
+    not asked for it yet (it syncs next time). The device takes changes in order, so one file still downloading can
+    make later ones read as not asked for.
+    """
+    have: int
+    fetching: int
+    waiting: int
+
+
+@dataclass(frozen=True)
+class Inventory:
+    """The documents, local files and videos the collection names, and how far each is with syncing.
+
+    ``ready``: synced as it is now; ``preparing``: new or changed, still to be prepared and sent; ``missing``: the
+    card names a file that is not on this device; ``too_big``: over the size sync carries. ``left_out`` names (up to
+    LEFT_OUT_NAMED) the missing and too big files as (reason, file name).
+    """
+    found: int = 0
+    ready: int = 0
+    preparing: int = 0
+    missing: int = 0
+    too_big: int = 0
+    left_out: tuple[tuple[str, str], ...] = ()
+    #: (device id, Delivery) for each other device that says what it has taken in.
+    deliveries: tuple[tuple[str, Delivery], ...] = ()
+
+
+def inventory(addon_dir: str, profile: str, query: Query, *, store: Store | None = None) -> Inventory:
+    """Count what the collection names, and how far each other device is with it. Reads files only for what synced
+    before, so it is quick on a new collection."""
+    conn = get_connection(addon_dir, profile)
+    # Instances of its own, so counting while a sync runs shares nothing with it.
+    families: list[Any] = [DocumentFamily(addon_dir, profile), LocalFileFamily(addon_dir, profile),
+                           VideoFileFamily(addon_dir, profile)]
+    unsent = set(conn.execute("SELECT r.family, r.key FROM sync_outbox o JOIN sync_revisions r ON r.id = o.revision_id "
+                              "WHERE o.published_at IS NULL").fetchall())
+    counts = {"ready": 0, "preparing": 0, "missing": 0, "too_big": 0}
+    left_out: list[tuple[str, str]] = []
+    ready: list[tuple[str, int, int]] = []  # (device, epoch, seq) of the revision each ready record is at
+    for family in families:
+        family.query = query
+        rows = conn.execute("SELECT b.key, b.value_hash, r.device, r.epoch, r.seq FROM sync_baseline b "
+                            "JOIN sync_revisions r ON r.id = b.revision_id WHERE b.family=?", (family.name,)).fetchall()
+        baseline = {key: digest for key, digest, *_ in rows}
+        revision = {key: (device, epoch, seq) for key, _, device, epoch, seq in rows}
+        for key, name, problem, value in family.inventory(conn, {key for key, digest in baseline.items() if digest}):
+            if problem is not None:
+                counts[problem] += 1
+                if len(left_out) < LEFT_OUT_NAMED:
+                    left_out.append((problem, name))
+            elif (value is not None and baseline.get(key) == record_hash(family, value)
+                  and (family.name, key) not in unsent):
+                counts["ready"] += 1
+                ready.append(revision[key])
+            else:
+                counts["preparing"] += 1
+    deliveries = []
+    for device, (received, waiting) in sorted(_announced(addon_dir, profile, store=store).items()):
+        have = sum(1 for author, epoch, seq in ready if author == device or seq <= _through(received, author, epoch))
+        fetching = min(waiting, len(ready) - have)
+        deliveries.append((device, Delivery(have, fetching, len(ready) - have - fetching)))
+    return Inventory(found=sum(counts.values()), left_out=tuple(left_out), deliveries=tuple(deliveries), **counts)
+
+
+def diagnostics(addon_dir: str, profile: str, query: Query | None, *, extra: dict[str, Any] | None = None,
+                now: float | None = None) -> str:
+    """A plain-text report of this device's sync, to save and send for help.
+
+    It holds counts, file names and the recent log; never keys, pairing codes or the contents of a file. Paths
+    under the home folder show as ``~``.
+    """
+    lines = ["Incremento Sync report", f"Written: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}"]
+    lines += [f"{name}: {value}" for name, value in (extra or {}).items()]
+
+    def section(title: str, write: Callable[[], list[str]]) -> None:
+        lines.append("")
+        lines.append(f"== {title}")
+        try:
+            lines.extend(write())
+        except Exception as exc:  # the report must still be written
+            lines.append(f"(could not be read: {type(exc).__name__}: {exc})")
+
+    def state() -> list[str]:
+        found = status(addon_dir, profile, now=now)
+        return [f"Set up: {'yes' if found.configured else 'no'}",
+                f"Syncs with: {_where(found.folder) if found.folder else 'nothing'}",
+                f"Last full sync: {_when(found.last_sync)}", f"Last sent changes: {_when(found.last_published)}",
+                f"Files to send: {found.files_to_send} ({found.bytes_to_send} bytes)",
+                f"Files to receive: {found.files_to_receive}", f"Conflicts: {found.conflicts}",
+                f"Waiting for Anki: {found.waiting_for_anki}", f"Waiting for files: {found.waiting_for_files}",
+                f"Waiting for other changes: {found.waiting_for_parents}", f"Waiting too long: {found.stale_waiting}"]
+
+    def files() -> list[str]:
+        if query is None:
+            return ["(no collection open)"]
+        found = inventory(addon_dir, profile, query)
+        out = [f"Documents and files found: {found.found}", f"Ready to sync: {found.ready}",
+               f"Being prepared: {found.preparing}", f"No file on this device: {found.missing}",
+               f"Too big to sync: {found.too_big}"]
+        out += [f"  {'no file' if reason == 'missing' else 'too big'}: {name}" for reason, name in found.left_out]
+        out += [f"Device {device}: {d.have} on it, {d.fetching} downloading, {d.waiting} not asked for yet"
+                for device, d in found.deliveries]
+        return out
+
+    def changes() -> list[str]:
+        conn = get_connection(addon_dir, profile)
+        inbox = conn.execute("SELECT status, count(*) FROM sync_inbox GROUP BY status ORDER BY status").fetchall()
+        unsent = conn.execute("SELECT count(*) FROM sync_outbox WHERE published_at IS NULL").fetchone()[0]
+        reasons = conn.execute("SELECT status, reason, count(*) FROM sync_inbox WHERE status IN "
+                               "('rejected', 'pending_anki', 'pending_blob', 'pending_parent') AND reason <> '' "
+                               "GROUP BY status, reason ORDER BY count(*) DESC LIMIT 10").fetchall()
+        out = [f"Changes not sent yet: {unsent}"] + [f"Received, {name}: {count}" for name, count in inbox]
+        out += [f"  {name} because {reason}: {count}" for name, reason, count in reasons]
+        return out
+
+    def devices() -> list[str]:
+        peers = peer_progress(addon_dir, profile)
+        return [f"{device}: {peer.behind} changes behind, {peer.files_waiting} files waiting"
+                for device, peer in sorted(peers.items())] or ["(none heard from yet)"]
+
+    section("Sync", state)
+    section("Documents and files on this device", files)
+    section("Changes", changes)
+    section("Other devices", devices)
+    section("Recent log", lambda: read_log(addon_dir, profile) or ["(empty)"])
+    report = "\n".join(lines) + "\n"
+    home = str(Path.home())
+    if len(home) > 3:
+        report = report.replace(home, "~").replace(home.replace("\\", "/"), "~")
+    return report
+
+
+def _when(timestamp: int | None) -> str:
+    return "never" if timestamp is None else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
 
 
 def _listener(on_progress: Callable[[SyncProgress], None] | None) -> Callable[[str, int, int], None] | None:
@@ -603,36 +820,55 @@ def peer_progress(addon_dir: str, profile: str, *, store: Store | None = None) -
     """
     conn = get_connection(addon_dir, profile)
     identity = sync_identity(conn)
+    if identity is None:
+        return {}
+    published = int(_meta(conn, "published_through") or 0)
+    progress: dict[str, PeerProgress] = {}
+    for device, (received, waiting) in _announced(addon_dir, profile, store=store).items():
+        through = _through(received, identity.device_id, identity.epoch)
+        progress[device] = PeerProgress(max(0, published - through), waiting)
+    return progress
+
+
+def _through(received: dict[str, Any], device: str, epoch: int) -> int:
+    """Through which of ``device``'s revisions (of ``epoch``) a peer has placed everything, from its announcement."""
+    mine = received.get(device)
+    through = mine.get("through", 0) if isinstance(mine, dict) and mine.get("epoch") == epoch else 0
+    return int(through) if isinstance(through, int) else 0
+
+
+def _announced(addon_dir: str, profile: str, *, store: Store | None = None) -> dict[str, tuple[dict[str, Any], int]]:
+    """What each other device announced it has taken in (its device.json ``received``) and how many files it still
+    waits for. Devices that do not say are left out; an unreachable sync location gives nothing."""
+    conn = get_connection(addon_dir, profile)
+    identity = sync_identity(conn)
     label = _meta(conn, "folder")
     if identity is None or label is None:
         return {}
-    published = int(_meta(conn, "published_through") or 0)
-    owned = store is None
-    target = store if store is not None else store_for(addon_dir, profile, label)
-    devices = f"{library_rel(identity.library_id)}/devices"
-    progress: dict[str, PeerProgress] = {}
+    announced: dict[str, tuple[dict[str, Any], int]] = {}
     try:
-        for entry in target.listdir(devices):
-            if not entry.is_dir or entry.is_symlink or entry.name == identity.device_id:
-                continue
-            data = target.read(f"{devices}/{entry.name}/device.json", 64 * 1024)
-            try:
-                info = json.loads(data.decode("utf-8")) if data else None
-            except ValueError:
-                continue
-            if not isinstance(info, dict) or not isinstance(info.get("received"), dict):
-                continue
-            mine = info["received"].get(identity.device_id)
-            through = mine.get("through", 0) if isinstance(mine, dict) and mine.get("epoch") == identity.epoch else 0
-            waiting = info.get("files_waiting", 0)
-            progress[entry.name] = PeerProgress(max(0, published - int(through)),
-                                                int(waiting) if isinstance(waiting, int) else 0)
-    except (StoreError, OSError):
+        owned = store is None
+        target = store if store is not None else store_for(addon_dir, profile, label)
+        devices = f"{library_rel(identity.library_id)}/devices"
+        try:
+            for entry in target.listdir(devices):
+                if not entry.is_dir or entry.is_symlink or entry.name == identity.device_id:
+                    continue
+                data = target.read(f"{devices}/{entry.name}/device.json", 64 * 1024)
+                try:
+                    info = json.loads(data.decode("utf-8")) if data else None
+                except ValueError:
+                    continue
+                if not isinstance(info, dict) or not isinstance(info.get("received"), dict):
+                    continue
+                waiting = info.get("files_waiting", 0)
+                announced[entry.name] = (info["received"], waiting if isinstance(waiting, int) else 0)
+        finally:
+            if owned and hasattr(target, "close"):
+                target.close()
+    except (StoreError, OSError, SyncSetupError):
         return {}
-    finally:
-        if owned and hasattr(target, "close"):
-            target.close()
-    return progress
+    return announced
 
 
 @dataclass(frozen=True)

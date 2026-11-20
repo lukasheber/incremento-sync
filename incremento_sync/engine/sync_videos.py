@@ -29,13 +29,15 @@ from typing import Any
 try:
     from . import paths, sync_paths
     from .sync_anki import Query
-    from .sync_blobs import FileHashes, MAX_BLOB_BYTES, has_blob, materialize, store_file
+    from .sync_blobs import FileHashes, MAX_BLOB_BYTES, has_blob, left_out, materialize, store_file
     from .sync_records import SyncScanError, card_key, split_card_key, value_hash
 except ImportError:
     import paths  # type: ignore[no-redef]
     import sync_paths  # type: ignore[no-redef]
     from sync_anki import Query  # type: ignore[no-redef]
-    from sync_blobs import FileHashes, MAX_BLOB_BYTES, has_blob, materialize, store_file  # type: ignore[no-redef]
+    from sync_blobs import (  # type: ignore[no-redef]
+        FileHashes, MAX_BLOB_BYTES, has_blob, left_out, materialize, store_file,
+    )
     from sync_records import SyncScanError, card_key, split_card_key, value_hash  # type: ignore[no-redef]
 
 NOTE_TYPE = "Incremento Video"
@@ -158,6 +160,23 @@ class VideoFileFamily:
         if "video" not in located:
             return None
         return {"note_id": note_id, "files": files}, located
+
+    def inventory(self, conn: sqlite3.Connection, known: set[str]) -> list[tuple[str, str, str | None, Any]]:
+        """(key, file name, why it is left out or None, value or None) of every video the collection names.
+
+        The value is read only for keys in ``known`` (already synced once), so counting a new collection does not
+        hash every file.
+        """
+        found = []
+        for note in self._notes():
+            key = f"{card_key(note[0])}/video"
+            path = self._file("video", note[2]["video"])
+            problem = left_out(path, MAX_VIDEO_BYTES)
+            identity = self._identity(note) if problem is None and key in known else None
+            found.append((key, path.name if path is not None else note[2]["video"], problem,
+                          identity[0] if identity else None))
+        self._hashes.save()
+        return found
 
     # --- the Family interface ------------------------------------------------------
 

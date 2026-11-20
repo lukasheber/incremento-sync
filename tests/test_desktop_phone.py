@@ -186,3 +186,71 @@ def test_a_newer_release_is_offered_and_a_declined_one_is_remembered():
         desktop.check_for_updates()
         assert len(asked) == 1  # switched off: not even asked
     """)
+
+
+def test_the_window_can_count_documents_and_save_a_report_without_keys():
+    _run(r"""
+        import os
+        class Done:
+            def __init__(self, task):
+                try:
+                    self.value, self.error = task(), None
+                except Exception as error:
+                    self.value, self.error = None, error
+            def result(self):
+                if self.error: raise self.error
+                return self.value
+        desktop.mw.taskman = types.SimpleNamespace(run_in_background=lambda task, done: done(Done(task)))
+        controller.start_phone()
+        counted = []
+        controller.inventory(counted.append)
+        assert counted and counted[0].found == 0  # this collection has no documents
+
+        report = os.path.join(desktop._addon_dir, "report.txt")
+        errors = []
+        controller.save_log(report, errors.append)
+        assert errors == [None]
+        text = open(report, encoding="utf-8").read()
+        assert "Incremento Sync report" in text and "Add-on version: " in text and "Phone server: running" in text
+        code = controller.phone().code.replace(" ", "")
+        assert code not in text
+
+        controller.save_log(os.path.join(desktop._addon_dir, "no-such-folder", "report.txt"), errors.append)
+        assert errors[-1]  # why it could not be saved
+        controller.disable()
+    """)
+
+
+def test_a_window_that_cannot_open_says_why_instead_of_doing_nothing():
+    _run(r"""
+        warned = []
+        desktop.showWarning = lambda text, **kw: warned.append(text)
+        desktop._profile_name = lambda: 1 / 0
+        desktop.open_dialog()
+        assert len(warned) == 1 and "ZeroDivisionError" in warned[0]
+    """)
+
+
+def test_the_counts_are_given_by_the_name_each_phone_was_paired_as():
+    _run(r"""
+        import sync_service
+        from sync_service import Delivery, Inventory
+        class Done:
+            def __init__(self, task): self.value = task()
+            def result(self): return self.value
+        desktop.mw.taskman = types.SimpleNamespace(run_in_background=lambda task, done: done(Done(task)))
+        controller.start_phone()
+        # Two pairings of one phone and one forgotten device: the phone's newest folder counts, the stranger not.
+        desktop._phone.owners = lambda: {"dev-old": "pixel", "dev-new": "pixel"}
+        sync_service.inventory = lambda *a, **kw: Inventory(found=5, ready=5, deliveries=(
+            ("dev-new", Delivery(4, 1, 0)), ("dev-old", Delivery(1, 0, 4)), ("stranger", Delivery(0, 0, 5))))
+        counted = []
+        controller.inventory(counted.append)
+        assert counted[0].deliveries == (("pixel", Delivery(4, 1, 0)),), counted[0].deliveries
+        controller.disable()
+
+        # Not a phone: the device furthest along stands for "the other device".
+        counted.clear()
+        desktop._Controller("P").inventory(counted.append)
+        assert counted[0].deliveries == (("", Delivery(4, 1, 0)),), counted[0].deliveries
+    """)

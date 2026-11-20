@@ -188,6 +188,23 @@ class DocumentFamily:
         return {"kind": kind, "content_id": content_id, "note_id": int(note_id or 0), "path": storage_key,
                 "version": version}, path
 
+    def inventory(self, conn: sqlite3.Connection, known: set[str]) -> list[tuple[str, str, str | None, Any]]:
+        """(key, file name, why it is left out or None, value or None) of every document the collection names.
+
+        The value is read only for keys in ``known`` (already synced once), so counting a new collection does not
+        hash every file.
+        """
+        found = []
+        for row in self._rows(conn):
+            key = f"{card_key(row[2])}/document:{row[1]}"
+            path = self._file(row[1], row[4] or "")
+            name = path.name if path is not None else str(row[4] or "").rpartition("/")[2]
+            problem = sync_blobs.left_out(path)
+            identity = self._identity(conn, row) if problem is None and key in known else None
+            found.append((key, name, problem, identity[0] if identity else None))
+        self._hashes.save()
+        return found
+
     # --- the Family interface ------------------------------------------------------
 
     def scan(self, conn: sqlite3.Connection) -> Iterable[tuple[str, dict[str, Any]]]:

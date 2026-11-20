@@ -238,3 +238,22 @@ def test_the_status_knows_when_this_device_last_put_changes_in_the_sync_location
     sync_service.sync_now(a.addon, "P", CARDS, store=a.store, now=lambda: 1_800_000_000.0)
 
     assert sync_service.status(a.addon, "P").last_published == 1_800_000_000
+
+
+def test_the_inventory_says_how_many_files_each_device_has_is_fetching_and_has_not_asked_for(tmp_path):
+    store = MemoryStore()
+    a, b = Device(tmp_path, "a", store), Device(tmp_path, "b", store)
+    a.add_documents(DOCUMENTS)
+    a.sync()
+    b_id = sync_service.sync_identity(db.get_connection(b.addon, "P")).device_id
+
+    before = dict(sync_service.inventory(a.addon, "P", CARDS, store=store).deliveries)
+    b.sync(budget=0.0)  # b knows of everything, but most files are still to come
+    early = dict(sync_service.inventory(a.addon, "P", CARDS, store=store).deliveries)[b_id]
+    while b.sync(budget=0.0)[0].more:
+        pass
+    done = dict(sync_service.inventory(a.addon, "P", CARDS, store=store).deliveries)[b_id]
+
+    assert before.get(b_id, sync_service.Delivery(0, 0, DOCUMENTS)).have == 0
+    assert early.have + early.fetching + early.waiting == DOCUMENTS and early.fetching > 0 and early.have < DOCUMENTS
+    assert done == sync_service.Delivery(have=DOCUMENTS, fetching=0, waiting=0)
